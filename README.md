@@ -80,7 +80,7 @@ A key architectural modification is **per-token timestep conditioning**, which a
 ## Project Structure
 
 ```
-ImageNet_inference/
+Self-Flow/
 ├── sample.py           # Main sampling script
 ├── checkpoints/        # Place model checkpoints here
 ├── requirements.txt    # Python dependencies
