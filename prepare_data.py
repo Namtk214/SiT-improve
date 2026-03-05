@@ -20,7 +20,7 @@ from tqdm import tqdm
 import torch
 from torchvision import datasets, transforms
 from diffusers.models import AutoencoderKL
-import array_record
+from array_record.python.array_record_module import ArrayRecordWriter
 
 # Load HuggingFace Token from Kaggle Secrets if available 
 try:
@@ -147,7 +147,7 @@ def main():
     
     def get_writer(shard_idx):
         path = os.path.join(args.output_dir, f"{args.split}-{shard_idx:05d}-of-{args.num_shards:05d}.ar")
-        return array_record.ArrayRecordWriter(path, options="")
+        return ArrayRecordWriter(path, options="")
 
     writer = get_writer(current_shard)
     
