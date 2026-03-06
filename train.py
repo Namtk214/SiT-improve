@@ -12,12 +12,8 @@ import optax
 import wandb
 from flax.training import train_state, checkpoints
 from flax import jax_utils
-from tqdm import tqdm
-from diffusers.models import AutoencoderKL
-import torch
 
 # Import data loaders
-import tensorflow as tf
 try:
     import numpy as np
     import grain.python as grain
@@ -293,6 +289,7 @@ class AsyncFIDWorker:
 
     def _decode_patchified_latents(self, latents):
         from einops import rearrange
+        import torch
 
         latents = np.asarray(latents, dtype=np.float32)
         latents = rearrange(
@@ -310,6 +307,8 @@ class AsyncFIDWorker:
         return ((images + 1.0) / 2.0).clamp(0, 1)
 
     def _decode_generated_latents(self, latents):
+        import torch
+
         latents = np.asarray(latents, dtype=np.float32)
         latents = torch.from_numpy(latents).float() / self.scale_factor
         with torch.no_grad():
@@ -523,8 +522,9 @@ def main():
     vae = None
     fid_worker = None
     if args.sample_freq > 0 or args.fid_freq > 0:
-        # Load SD-VAE exclusively on CPU (Host) for standalone asynchronous decoding.
-        # This keeps decode / FID work off the TPU training path.
+        # Lazy-load CPU-side libraries to reduce native-runtime conflicts on TPU.
+        from diffusers.models import AutoencoderKL
+
         print("Loading VAE on Host CPU for WandB image generation / FID...")
         vae = AutoencoderKL.from_pretrained("stabilityai/sd-vae-ft-ema")
         vae.eval()
@@ -642,6 +642,8 @@ def main():
                 
                 # Hand over to background worker to pull array to host, decode in PyTorch VAE, and wandb.log
                 def background_decode_and_log(z_dev, classes, target_step):
+                    import torch
+
                     # Blocking device_get ONLY on this temporary background thread
                     z = np.asarray(jax.device_get(z_dev), dtype=np.float32)
                     z = torch.from_numpy(z)
