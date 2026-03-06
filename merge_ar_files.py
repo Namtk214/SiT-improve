@@ -11,6 +11,7 @@ def main():
     parser.add_argument("--output-dir", required=True, help="Directory to save merged .ar files")
     parser.add_argument("--split", default="train", help="Prefix of the files, e.g., 'train'")
     parser.add_argument("--shards-out", type=int, default=128, help="Number of final .ar files you want (Kaggle max 1000)")
+    parser.add_argument("--remove-input", action="store_true", help="Delete input .ar files immediately after they are merged to save disk space")
     args = parser.parse_args()
 
     os.makedirs(args.output_dir, exist_ok=True)
@@ -61,6 +62,14 @@ def main():
             else:
                 for record in reader:
                     writer.write(record)
+                    
+            if hasattr(reader, "close"):
+                reader.close()
+            del reader
+            
+            if args.remove_input:
+                os.remove(file)
+                
         except Exception as e:
             print(f"Error reading {file}: {e}")
             raise
