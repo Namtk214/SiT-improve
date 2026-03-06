@@ -200,5 +200,36 @@ def main():
     writer.close()
     print("TPU Data preparation complete.")
 
+    # --- Tự động tạo dataset-metadata.json để upload lên Kaggle ---
+    try:
+        from kaggle_secrets import UserSecretsClient
+        user_secrets = UserSecretsClient()
+        # Thử lấy username từ môi trường hoặc giả định là bạn đã set API
+        kaggle_user = os.environ.get("KAGGLE_USERNAME") 
+        if not kaggle_user:
+             # Dự phòng nếu bạn chạy trên Kaggle mà chưa set env
+             import json
+             # Tạo placeholder để bạn vào sửa tay hoặc dùng script upload của tôi
+             meta_data = {
+                "title": "ImageNet VAE Latents ArrayRecord",
+                "id": f"your_username/imagenet-vae-latents-ar",
+                "licenses": [{"name": "CC0-1.0"}]
+             }
+        else:
+            meta_data = {
+                "title": "ImageNet VAE Latents ArrayRecord",
+                "id": f"{kaggle_user}/imagenet-vae-latents-ar",
+                "licenses": [{"name": "CC0-1.0"}]
+            }
+            
+        import json
+        meta_path = os.path.join(args.output_dir, "dataset-metadata.json")
+        with open(meta_path, "w") as f:
+            json.dump(meta_data, f, indent=4)
+        print(f"Đã tạo file metadata tại: {meta_path}")
+        print("Bây giờ bạn có thể dùng lệnh 'kaggle datasets create -p " + args.output_dir + "' để upload.")
+    except Exception as e:
+        print(f"Không thể tạo file metadata tự động: {e}")
+
 if __name__ == "__main__":
     main()
