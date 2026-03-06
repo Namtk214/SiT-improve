@@ -1,10 +1,13 @@
 import os
+import math
 import argparse
 import pickle
 import time
 import threading
 import queue
 import functools
+import subprocess
+import shutil
 
 import jax
 import jax.numpy as jnp
@@ -13,9 +16,11 @@ import wandb
 from tqdm import tqdm
 from diffusers.models import AutoencoderKL
 import torch
-from flax.training import train_state, checkpoints
+from flax import struct
+from flax.training import train_state
 from flax import jax_utils, core
 import flax.linen as nn
+import orbax.checkpoint as ocp
 from diffusers.models import AutoencoderKL
 import torch
 
@@ -315,6 +320,95 @@ class AsyncWandbLogger:
         self.queue.put(None)
         self.thread.join()
 
+class AsyncFIDWorker:
+    """Background thread to calculate FID without blocking TPU pipeline."""
+    def __init__(self, vae, scale_factor=0.18215, num_fid_samples=4000):
+        self.queue = queue.Queue(maxsize=2)
+        self.vae = vae
+        self.scale_factor = scale_factor
+        self.num_fid_samples = num_fid_samples
+        self.thread = threading.Thread(target=self._worker, daemon=True)
+        self.is_real_computed = False
+        self.real_latents_buffer = []
+        self.thread.start()
+        
+    def add_real_latents(self, latents):
+        if self.is_real_computed:
+            return
+        current_len = sum(len(x) for x in self.real_latents_buffer)
+        if current_len < self.num_fid_samples:
+            self.real_latents_buffer.append(np.array(latents))
+            
+    def _worker(self):
+        try:
+            from torchmetrics.image.fid import FrechetInceptionDistance
+            from einops import rearrange
+            
+            # normalize=True allows passing float tensors in [0, 1]
+            fid_metric = FrechetInceptionDistance(feature=2048, reset_real_features=False, normalize=True).to('cpu')
+            
+            while True:
+                item = self.queue.get()
+                if item is None:
+                    break
+                    
+                fake_latents_list, target_step = item
+                
+                # Compute real features if we haven't yet and have enough latents
+                if not self.is_real_computed and self.real_latents_buffer:
+                    print(f"FID Worker: Computing real features from {self.num_fid_samples} training latents...")
+                    real_latents = np.concatenate(self.real_latents_buffer, axis=0)[:self.num_fid_samples]
+                    
+                    for i in range(0, len(real_latents), 64):
+                        batch_l = real_latents[i:i+64]
+                        batch_l = rearrange(batch_l, "b (h w) (p1 p2 c) -> b c (h p1) (w p2)", h=16, w=16, p1=2, p2=2, c=4)
+                        batch_l = torch.from_numpy(batch_l) / self.scale_factor
+                        with torch.no_grad():
+                            imgs = self.vae.decode(batch_l).sample
+                        imgs = (imgs + 1.0) / 2.0
+                        imgs = imgs.clamp(0, 1)
+                        fid_metric.update(imgs, real=True)
+                    
+                    self.is_real_computed = True
+                    self.real_latents_buffer.clear()
+                    print("FID Worker: Real features computed successfully.")
+                
+                if not self.is_real_computed:
+                    print("FID Worker: Can't compute FID yet, real features not populated.")
+                    self.queue.task_done()
+                    continue
+                    
+                print(f"FID Worker: Decoding {len(fake_latents_list)} batches of fake latents and computing FID...")
+                for z_dev in fake_latents_list:
+                    z = jax.device_get(z_dev) # Transfer from TPU
+                    z = torch.from_numpy(z) / self.scale_factor
+                    with torch.no_grad():
+                        imgs = self.vae.decode(z).sample
+                    imgs = (imgs + 1.0) / 2.0
+                    imgs = imgs.clamp(0, 1)
+                    fid_metric.update(imgs, real=False)
+                    
+                fid_score = float(fid_metric.compute())
+                fid_metric.reset() # resets fake features only
+                
+                wandb.log({"val/FID": fid_score, "train/step": target_step})
+                print(f"FID Worker: FID = {fid_score:.4f} at step {target_step}")
+                
+                self.queue.task_done()
+        except Exception as e:
+            print(f"FID Worker error: {e}")
+            self.queue.task_done()
+            
+    def compute_fid(self, fake_latents_list, step):
+        try:
+            self.queue.put_nowait((fake_latents_list, step))
+        except queue.Full:
+            print("FID Worker queue full, skipping this FID evaluation.")
+            
+    def shutdown(self):
+        self.queue.put(None)
+        self.thread.join()
+
   
 @functools.partial(jax.jit, static_argnames=('hidden_size', 'depth', 'num_heads', 'num_steps', 'cfg_scale'))
 def sample_latents_jit(params, class_labels, rng, hidden_size=1152, depth=28, num_heads=16, num_steps=50, cfg_scale=4.0):
@@ -369,9 +463,39 @@ def main():
     parser.add_argument("--wandb-project", type=str, default="selfflow-jax", help="WandB Project Name")
     parser.add_argument("--log-freq", type=int, default=20, help="Log step metrics every N steps")
     parser.add_argument("--sample-freq", type=int, default=1000, help="Generate and decode samples every M steps")
+    parser.add_argument("--fid-freq", type=int, default=10000, help="Generate and evaluate FID every N steps")
+    parser.add_argument("--num-fid-samples", type=int, default=4000, help="Number of samples for FID")
     parser.add_argument("--model", type=str, default="DiT-XL/2", choices=["DiT-XL/2", "DiT-B/2", "DiT-S/2"], help="Model architecture")
+    parser.add_argument("--online-encode", type=str, default=None, help="Path to raw ImageNet data to trigger auto TPU VAE encoding before training")
+    parser.add_argument("--online-batch-size", type=int, default=128, help="Batch size for online VAE encoding")
     args = parser.parse_args()
     
+    # Checkpoint settings via Orbax
+    options = ocp.CheckpointManagerOptions(max_to_keep=1, create=True)
+    checkpoint_manager = ocp.CheckpointManager(args.ckpt_dir, options=options)
+    
+    # 0. Optional Online ArrayRecord Encoding
+    if args.online_encode is not None:
+        print(f"Online Encode requested. Source data: {args.online_encode}")
+        ar_output_dir = "/kaggle/working/latents"
+        os.makedirs(ar_output_dir, exist_ok=True)
+        try:
+            cmd = [
+                "python", "prepare_data_tpu.py",
+                "--split", "train",
+                "--data-dir", args.online_encode,
+                "--output-dir", ar_output_dir,
+                "--batch-size", str(args.online_batch_size),
+                "--num-shards", "1024"
+            ]
+            print(f"Executing: {' '.join(cmd)}")
+            subprocess.run(cmd, check=True)
+            print("Online Encoding completed successfully!")
+            args.data_path = f"{ar_output_dir}/*.ar" # Override data paths automatically
+        except Exception as e:
+            print(f"Online Encoding Failed: {e}")
+            return
+            
     # Initialize WandB
     wandb.init(project=args.wandb_project, config=vars(args))
     wandb.define_metric("train/step")
@@ -427,6 +551,13 @@ def main():
     vae = AutoencoderKL.from_pretrained("stabilityai/sd-vae-ft-ema")
     vae.eval()
     
+    try:
+        from torchmetrics.image.fid import FrechetInceptionDistance
+        fid_worker = AsyncFIDWorker(vae=vae, num_fid_samples=args.num_fid_samples)
+    except ImportError:
+        print("WARNING: torchmetrics not installed. FID evaluation will be disabled. Run pip install torchmetrics.")
+        fid_worker = None
+    
     global_step = 0
     t0 = time.time()
     
@@ -443,12 +574,16 @@ def main():
                 batch_x = jax.random.normal(rng_mock, (args.batch_size, n_patches, patch_dim))
                 batch_y = jax.random.randint(rng_mock, (args.batch_size,), 0, 1000)
             
+            # Add early original batch_x to fid_worker real buffer (before reshape)
+            if getattr(locals().get('fid_worker', None), 'is_real_computed', True) is False:
+                fid_worker.add_real_latents(batch_x)
+
             # Reshape batch for SPMD distribution: (Global, ...) -> (Devices, Local, ...)
-            batch_x = batch_x.reshape(num_devices, local_batch_size, n_patches, patch_dim)
-            batch_y = batch_y.reshape(num_devices, local_batch_size)
+            batch_x_dist = batch_x.reshape(num_devices, local_batch_size, n_patches, patch_dim)
+            batch_y_dist = batch_y.reshape(num_devices, local_batch_size)
             
             # Pmap execute step
-            state, metrics, rng = train_step(state, (batch_x, batch_y), rng, teacher_layer, student_layer)
+            state, metrics, rng = train_step(state, (batch_x_dist, batch_y_dist), rng, teacher_layer, student_layer)
             global_step += 1
             
             # Periodic Async Logging
@@ -503,8 +638,36 @@ def main():
                 # Fire and forget decoding thread
                 threading.Thread(target=background_decode_and_log, args=(latents_dev, sample_classes, global_step), daemon=True).start()
 
-    # Save checkpoint at end
-    os.makedirs(args.ckpt_dir, exist_ok=True)
-    checkpoints.save_checkpoint(ckpt_dir=args.ckpt_dir, target=jax_utils.unreplicate(state.params), step=global_step)
+            # Periodic Asynchronous FID4K Eval
+            if global_step % args.fid_freq == 0 and locals().get('fid_worker') is not None:
+                import math
+                print(f"Step {global_step}: Generating {args.num_fid_samples} latents for FID computation...")
+                fid_batch_size = args.batch_size
+                num_fid_batches = math.ceil(args.num_fid_samples / fid_batch_size)
+                
+                all_fake_latents_dev = []
+                single_params_ema = jax.tree_util.tree_map(lambda w: w[0], state.ema_params) 
+                
+                for _ in range(num_fid_batches):
+                    # Use Core 0 explicitly to generate Latents
+                    rng, sample_rng = jax.random.split(rng[0], 2)
+                    sample_classes = jax.random.randint(sample_rng, (fid_batch_size,), 0, 1000)
+                    
+                    latents_dev = sample_latents_jit(
+                        single_params_ema, sample_classes, sample_rng,
+                        hidden_size=m_cfg["hidden_size"], depth=m_cfg["depth"], num_heads=m_cfg["num_heads"], num_steps=50
+                    )
+                    all_fake_latents_dev.append(latents_dev)
+                    
+                    # Ensure next step has unique rng across devices
+                    rng = jax.random.split(rng, num_devices)
+                    
+                fid_worker.compute_fid(all_fake_latents_dev, global_step)
+
+    # Save checkpoint at end (keeping only the last one via Orbax logic)
+    unreplicated_state = jax_utils.unreplicate(state)
+    checkpoint_manager.save(global_step, args=ocp.args.StandardSave(unreplicated_state))
+    checkpoint_manager.wait_until_finished()
+    
     logger.shutdown()
     print("Done")
