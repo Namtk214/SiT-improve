@@ -25,6 +25,22 @@ from src.sampling import denoise_loop
 from src.utils import batched_prc_img, scattercat
 
 
+def log_stage(message):
+    print(f"[train.py] {message}", flush=True)
+
+
+def safe_wandb_log(metrics, step=None):
+    if getattr(wandb, "run", None) is None:
+        return
+    try:
+        if step is None:
+            wandb.log(metrics)
+        else:
+            wandb.log(metrics, step=step)
+    except Exception as e:
+        log_stage(f"WandB logging error: {e}")
+
+
 def create_train_state(rng, config, learning_rate):
     """Initializes the model and TrainState."""
     model = SelfFlowPerTokenDiT(
@@ -239,7 +255,11 @@ def replicated_metrics_to_host(metrics):
 
 class AsyncWandbLogger:
     """Background thread to log metrics without blocking TPU pipeline."""
-    def __init__(self, max_queue_size=50):
+    def __init__(self, max_queue_size=50, enabled=True):
+        self.enabled = enabled
+        self.thread = None
+        if not self.enabled:
+            return
         self.queue = queue.Queue(maxsize=max_queue_size)
         self.thread = threading.Thread(target=self._worker, daemon=True)
         self.thread.start()
@@ -255,13 +275,15 @@ class AsyncWandbLogger:
             # Perform jax.device_get to block *only* the worker thread
             try:
                 metrics_cpu = jax.tree_util.tree_map(lambda x: float(x) if hasattr(x, 'shape') and x.shape == () else x, jax.device_get(metrics))
-                wandb.log(metrics_cpu, step=step)
+                safe_wandb_log(metrics_cpu, step=step)
             except Exception as e:
-                print(f"WandB Logging error: {e}")
+                log_stage(f"WandB Logging error: {e}")
             finally:
                 self.queue.task_done()
                 
     def log(self, metrics, step):
+        if not self.enabled:
+            return
         try:
             # We use put_nowait so if the queue backs up, we just drop logs rather than stalling TPU
             self.queue.put_nowait((metrics, step))
@@ -269,6 +291,8 @@ class AsyncWandbLogger:
             pass # Skip logging if CPU is lagging too far behind TPU
             
     def shutdown(self):
+        if not self.enabled:
+            return
         self.queue.put(None)
         self.thread.join()
 
@@ -400,7 +424,7 @@ class AsyncFIDWorker:
 
                     fid_score = float(fid_metric.compute())
                     fid_metric.reset()
-                    wandb.log({"val/FID": fid_score, "train/step": target_step}, step=target_step)
+                    safe_wandb_log({"val/FID": fid_score, "train/step": target_step}, step=target_step)
                     print(f"FID Worker: val/FID={fid_score:.4f} at step {target_step}")
                 finally:
                     self.queue.task_done()
@@ -470,6 +494,7 @@ def sample_latents_jit(params, class_labels, rng, num_steps=50, cfg_scale=4.0):
 
 
 def main():
+    log_stage("main() entered")
     parser = argparse.ArgumentParser(description="Train Self-Flow DiT (JAX)")
     parser.add_argument("--batch-size", type=int, default=256, help="Global Batch size (will be divided by 8 for TPU v5e-8)")
     parser.add_argument("--epochs", type=int, default=100, help="Number of training epochs")
@@ -486,7 +511,9 @@ def main():
     parser.add_argument("--fid-freq", type=int, default=10000, help="Generate and evaluate FID every N steps (0 disables)")
     parser.add_argument("--num-fid-samples", type=int, default=4000, help="Number of generated/real samples used for FID")
     parser.add_argument("--fid-batch-size", type=int, default=32, help="CPU decode batch size used for FID real/fake image batches")
+    parser.add_argument("--no-wandb", action="store_true", help="Disable Weights & Biases logging for debugging")
     args = parser.parse_args()
+    log_stage(f"Arguments parsed. no_wandb={args.no_wandb}")
 
     if args.eval_batches <= 0:
         raise ValueError("--eval-batches must be greater than 0")
@@ -494,55 +521,65 @@ def main():
         raise ValueError("--num-fid-samples must be greater than 0 when FID is enabled")
     if args.fid_freq > 0 and args.fid_batch_size <= 0:
         raise ValueError("--fid-batch-size must be greater than 0 when FID is enabled")
-    
-    # Initialize WandB
-    wandb.init(project=args.wandb_project, config=vars(args))
-    wandb.define_metric("train/step")
-    wandb.define_metric("*", step_metric="train/step")
-    logger = AsyncWandbLogger()
 
     # Device count checks
+    log_stage("About to call jax.device_count()")
     num_devices = jax.device_count()
+    log_stage(f"jax.device_count() returned {num_devices}")
     if args.batch_size % num_devices != 0:
         raise ValueError(f"--batch-size ({args.batch_size}) must be divisible by the JAX device count ({num_devices})")
     local_batch_size = args.batch_size // num_devices
-    print(f"TPU Cores: {num_devices}. Global Batch: {args.batch_size}, Local Batch: {local_batch_size}")
+    log_stage(f"TPU Cores: {num_devices}. Global Batch: {args.batch_size}, Local Batch: {local_batch_size}")
+
+    if args.no_wandb:
+        log_stage("WandB disabled by --no-wandb")
+    else:
+        log_stage("Initializing WandB...")
+        wandb.init(project=args.wandb_project, config=vars(args))
+        wandb.define_metric("train/step")
+        wandb.define_metric("*", step_metric="train/step")
+        log_stage("WandB initialized.")
+    logger = AsyncWandbLogger(enabled=not args.no_wandb)
 
     rng = jax.random.PRNGKey(42)
+    log_stage("Creating model config")
     
     config = dict(
         input_size=32, patch_size=2, in_channels=4, hidden_size=1152, depth=28,
         num_heads=16, mlp_ratio=4.0, num_classes=1001, learn_sigma=True, compatibility_mode=True,
     )
     
+    log_stage("Initializing train state")
     state = create_train_state(rng, config, args.learning_rate)
     # Replicate state across all TPU cores
     state = jax_utils.replicate(state)
     rng = jax.random.split(rng, num_devices)
     
-    print("Initialized Replicated TrainState")
+    log_stage("Initialized replicated TrainState")
     
     patch_dim = config["in_channels"] * config["patch_size"] ** 2
     n_patches = (config["input_size"] // config["patch_size"]) ** 2
     
+    log_stage("Initializing training dataloader")
     try:
         dataloader = get_arrayrecord_dataloader(data_pattern=args.data_path, batch_size=args.batch_size, is_training=True)
         data_iterator = iter(dataloader)
-        print("DataLoader initialized successfully via Grain.")
+        log_stage("Training dataloader initialized successfully via Grain.")
     except Exception as e:
-        print(f"Failed to load ArrayRecord via Grain. Falling back to mocked batches. Error: {e}")
+        log_stage(f"Failed to load ArrayRecord via Grain. Falling back to mocked batches. Error: {e}")
         data_iterator = None
 
     val_iterator = None
     if args.val_data_path is not None:
+        log_stage("Initializing validation dataloader")
         try:
             val_iterator = create_data_iterator(data_pattern=args.val_data_path, batch_size=args.batch_size, is_training=False)
-            print("Validation DataLoader initialized successfully via Grain.")
+            log_stage("Validation dataloader initialized successfully via Grain.")
         except Exception as e:
-            print(f"Failed to load validation ArrayRecord via Grain. Validation will be disabled. Error: {e}")
+            log_stage(f"Failed to load validation ArrayRecord via Grain. Validation will be disabled. Error: {e}")
             val_iterator = None
     elif args.eval_freq > 0:
-        print("Validation disabled because --val-data-path is not set.")
+        log_stage("Validation disabled because --val-data-path is not set.")
 
     vae = None
     fid_worker = None
@@ -553,9 +590,10 @@ def main():
         # Lazy-load CPU-side libraries to reduce native-runtime conflicts on TPU.
         from diffusers.models import AutoencoderKL
 
-        print("Loading VAE on Host CPU for WandB image generation / FID...")
+        log_stage("Loading VAE on Host CPU for WandB image generation / FID...")
         vae = AutoencoderKL.from_pretrained("stabilityai/sd-vae-ft-ema")
         vae.eval()
+        log_stage("Host-side VAE ready")
 
     if args.fid_freq > 0:
         try:
@@ -567,14 +605,14 @@ def main():
                 num_fid_samples=args.num_fid_samples,
                 decode_batch_size=args.fid_batch_size,
             )
-            print(
+            log_stage(
                 f"FID worker initialized. Real features will be collected from {fid_real_source} batches "
                 f"and decoded on CPU with batch size {args.fid_batch_size}."
             )
         except ImportError:
-            print("WARNING: torchmetrics is not installed. FID will be disabled.")
+            log_stage("WARNING: torchmetrics is not installed. FID will be disabled.")
         except Exception as e:
-            print(f"WARNING: failed to initialize FID worker. FID will be disabled. Error: {e}")
+            log_stage(f"WARNING: failed to initialize FID worker. FID will be disabled. Error: {e}")
     
     global_step = 0
     t0 = time.time()
@@ -692,18 +730,19 @@ def main():
                     images = images.clamp(0, 1).permute(0, 2, 3, 1).numpy()
                     images = (images * 255).astype(np.uint8)
                     
-                    wandb.log({
+                    safe_wandb_log({
                         "train/step": target_step,
                         "samples": [wandb.Image(img, caption=f"Class {cls}") for img, cls in zip(images, classes)]
-                    })
+                    }, step=target_step)
 
                 # Fire and forget decoding thread
                 threading.Thread(target=background_decode_and_log, args=(latents_dev, sample_classes, global_step), daemon=True).start()
 
     # Save checkpoint at end
+    log_stage("Saving final checkpoint")
     os.makedirs(args.ckpt_dir, exist_ok=True)
     checkpoints.save_checkpoint(ckpt_dir=args.ckpt_dir, target=jax_utils.unreplicate(state.params), step=global_step)
     if fid_worker is not None:
         fid_worker.shutdown()
     logger.shutdown()
-    print("Done")
+    log_stage("Done")
