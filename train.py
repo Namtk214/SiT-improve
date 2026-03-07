@@ -5,6 +5,8 @@ import time
 import threading
 import queue
 import functools
+import shutil
+import subprocess
 
 import jax
 import jax.numpy as jnp
@@ -39,6 +41,65 @@ def safe_wandb_log(metrics, step=None):
             wandb.log(metrics, step=step)
     except Exception as e:
         log_stage(f"WandB logging error: {e}")
+
+
+def _collect_vfio_probe_output(device_path):
+    commands = []
+    if shutil.which("lsof"):
+        commands.append(["lsof", "-w", device_path])
+    if shutil.which("fuser"):
+        commands.append(["fuser", "-v", device_path])
+
+    results = []
+    for command in commands:
+        try:
+            completed = subprocess.run(
+                command,
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+        except Exception as exc:
+            results.append(f"$ {' '.join(command)}\n<probe failed: {exc}>")
+            continue
+
+        output = (completed.stdout or "").strip()
+        stderr = (completed.stderr or "").strip()
+        body = "\n".join(part for part in [output, stderr] if part)
+        if not body:
+            body = f"<no output, exit_code={completed.returncode}>"
+        results.append(f"$ {' '.join(command)}\n{body}")
+    return results
+
+
+def probe_vfio_owners():
+    vfio_root = "/dev/vfio"
+    if not os.path.isdir(vfio_root):
+        log_stage("VFIO probe skipped: /dev/vfio is not present on this machine.")
+        return
+
+    device_paths = []
+    for name in sorted(os.listdir(vfio_root)):
+        if name.isdigit():
+            device_paths.append(os.path.join(vfio_root, name))
+
+    if not device_paths:
+        log_stage("VFIO probe: no numbered /dev/vfio/* device nodes were found.")
+        return
+
+    log_stage(f"VFIO probe: checking {', '.join(device_paths)}")
+    probe_sections = []
+    for device_path in device_paths:
+        section_lines = [f"Device: {device_path}"]
+        section_lines.extend(_collect_vfio_probe_output(device_path))
+        probe_sections.append("\n".join(section_lines))
+
+    log_stage("VFIO probe results:\n" + "\n\n".join(probe_sections))
+    log_stage(
+        "If TPU init still fails with 'Device or resource busy', kill the owning PID(s) "
+        "or restart the kernel/runtime before retrying."
+    )
 
 
 def create_train_state(rng, config, learning_rate):
@@ -523,8 +584,14 @@ def main():
         raise ValueError("--fid-batch-size must be greater than 0 when FID is enabled")
 
     # Device count checks
+    probe_vfio_owners()
     log_stage("About to call jax.device_count()")
-    num_devices = jax.device_count()
+    try:
+        num_devices = jax.device_count()
+    except Exception as exc:
+        log_stage(f"jax.device_count() failed: {exc}")
+        probe_vfio_owners()
+        raise
     log_stage(f"jax.device_count() returned {num_devices}")
     if args.batch_size % num_devices != 0:
         raise ValueError(f"--batch-size ({args.batch_size}) must be divisible by the JAX device count ({num_devices})")
