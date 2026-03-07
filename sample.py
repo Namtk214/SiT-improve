@@ -26,7 +26,7 @@ import orbax.checkpoint as ocp
 # Import from local src/ folder
 from src.model import SelfFlowPerTokenDiT
 from src.sampling import denoise_loop
-from src.utils import batched_prc_img, scattercat
+from src.utils import batched_prc_img
 
 
 def create_npz_from_samples(samples, output_path):
@@ -121,13 +121,14 @@ def build_sample_step(model, vae, scale_factor, shift_factor):
             p1=patch_size, p2=patch_size
         )
         
-        x, x_ids = batched_prc_img(noise_patched)
+        x, _ = batched_prc_img(noise_patched)
+        token_h = latent_size // patch_size
+        token_w = latent_size // patch_size
         
         # Enable CFG
         use_cfg = cfg_scale > 1.0
         if use_cfg:
             x = jnp.concatenate([x, x], axis=0)
-            x_ids = jnp.concatenate([x_ids, x_ids], axis=0)
             null_labels = jnp.full_like(class_labels, 1000)
             class_labels = jnp.concatenate([null_labels, class_labels], axis=0)
             
@@ -155,9 +156,8 @@ def build_sample_step(model, vae, scale_factor, shift_factor):
         
         if use_cfg:
             samples = samples[batch_size:]
-            x_ids = x_ids[batch_size:]
-            
-        samples = scattercat(samples, x_ids)
+        
+        samples = rearrange(samples, "b (h w) c -> b c h w", h=token_h, w=token_w)
         samples = rearrange(
             samples,
             "b (c p1 p2) h w -> b c (h p1) (w p2)",
