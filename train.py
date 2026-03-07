@@ -93,6 +93,67 @@ def probe_vfio_owners():
     )
 
 
+def _format_subprocess_failure(stdout, stderr, returncode):
+    lines = []
+    if returncode is not None:
+        lines.append(f"returncode={returncode}")
+
+    stdout = (stdout or "").strip()
+    stderr = (stderr or "").strip()
+
+    if stdout:
+        stdout_lines = stdout.splitlines()[-8:]
+        lines.append("stdout tail:")
+        lines.extend(stdout_lines)
+    if stderr:
+        stderr_lines = stderr.splitlines()[-12:]
+        lines.append("stderr tail:")
+        lines.extend(stderr_lines)
+
+    return "\n".join(lines) if lines else "<no subprocess output>"
+
+
+def probe_host_vae_subprocess(timeout_seconds=180):
+    probe_code = """
+import os
+os.environ.setdefault("USE_TF", "0")
+os.environ.setdefault("TRANSFORMERS_NO_TF", "1")
+os.environ.setdefault("PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION", "python")
+os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
+import jax.numpy as jnp
+from diffusers import FlaxAutoencoderKL
+FlaxAutoencoderKL.from_pretrained(
+    "stabilityai/sd-vae-ft-ema",
+    from_pt=True,
+    use_safetensors=True,
+    dtype=jnp.bfloat16,
+)
+print("HOST_VAE_PROBE_OK", flush=True)
+""".strip()
+
+    try:
+        completed = subprocess.run(
+            [sys.executable, "-c", probe_code],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=timeout_seconds,
+        )
+    except subprocess.TimeoutExpired as exc:
+        return False, f"timed out after {timeout_seconds}s"
+    except Exception as exc:
+        return False, f"failed to launch subprocess probe: {exc}"
+
+    if completed.returncode == 0 and "HOST_VAE_PROBE_OK" in (completed.stdout or ""):
+        return True, None
+
+    return False, _format_subprocess_failure(
+        completed.stdout,
+        completed.stderr,
+        completed.returncode,
+    )
+
+
 def resolve_arrayrecord_paths(data_pattern):
     expanded_pattern = os.path.expanduser(data_pattern)
     if os.path.isdir(expanded_pattern):
@@ -752,6 +813,7 @@ def run_preflight_checks(
     real_latents_patchified,
     preflight_sample_count,
     preflight_fid_samples,
+    strict_vae=False,
 ):
     log_stage("Starting preflight checks")
 
@@ -770,7 +832,13 @@ def run_preflight_checks(
     rng = rng.at[0].set(sample_rng_base)
     log_stage(f"Preflight fake latent generation OK: shape={fake_latents.shape}")
 
-    host_vae = ensure_vae()
+    try:
+        host_vae = ensure_vae()
+    except RuntimeError as exc:
+        if strict_vae:
+            raise RuntimeError(f"Preflight failed because host VAE is unavailable: {exc}") from exc
+        log_stage(f"WARNING: skipping preflight VAE/FID decode because host VAE is unavailable. {exc}")
+        return rng
 
     if preflight_sample_count > 0:
         preview_count = min(preflight_sample_count, len(fake_latents))
@@ -916,16 +984,59 @@ def main():
         log_stage("Validation disabled because --val-data-path is not set.")
 
     vae = None
+    vae_probe_checked = False
+    vae_probe_ok = False
+    vae_probe_error = None
     fid_worker = None
     fid_real_source = "live train batches"
     if args.val_data_path is not None and args.eval_freq > 0:
         fid_real_source += " + validation batches"
 
     def ensure_vae():
-        nonlocal vae
+        nonlocal vae, vae_probe_checked, vae_probe_ok, vae_probe_error
         if vae is None:
+            if not vae_probe_checked:
+                log_stage("Checking host VAE availability in a subprocess")
+                vae_probe_ok, vae_probe_error = probe_host_vae_subprocess()
+                vae_probe_checked = True
+                if vae_probe_ok:
+                    log_stage("Host VAE subprocess probe succeeded")
+                else:
+                    raise RuntimeError(
+                        "host VAE probe failed in a subprocess; sample/FID decode is unsafe in this "
+                        f"environment.\n{vae_probe_error}"
+                    )
+            if not vae_probe_ok:
+                raise RuntimeError(
+                    "host VAE probe failed in a subprocess; sample/FID decode is unsafe in this "
+                    f"environment.\n{vae_probe_error}"
+                )
             vae = load_host_vae()
         return vae
+
+    vae_features_requested = (
+        args.sample_freq > 0
+        or args.fid_freq > 0
+        or (args.preflight_checks and (args.preflight_sample_count > 0 or args.preflight_fid_samples > 0))
+    )
+    if vae_features_requested and not vae_probe_checked:
+        log_stage("Checking host VAE availability in a subprocess")
+        vae_probe_ok, vae_probe_error = probe_host_vae_subprocess()
+        vae_probe_checked = True
+        if vae_probe_ok:
+            log_stage("Host VAE subprocess probe succeeded")
+        else:
+            log_stage(
+                "WARNING: host VAE probe failed in a subprocess. "
+                "Sample/FID decode will be disabled for this run.\n"
+                f"{vae_probe_error}"
+            )
+            if args.sample_freq > 0:
+                log_stage("Disabling periodic sample generation because host VAE is unavailable.")
+                args.sample_freq = 0
+            if args.fid_freq > 0:
+                log_stage("Disabling FID because host VAE is unavailable.")
+                args.fid_freq = 0
 
     if args.fid_freq > 0:
         try:
@@ -967,6 +1078,7 @@ def main():
             real_latents_patchified=preflight_real_latents,
             preflight_sample_count=args.preflight_sample_count,
             preflight_fid_samples=args.preflight_fid_samples,
+            strict_vae=args.preflight_only,
         )
 
         if args.preflight_only:
