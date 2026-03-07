@@ -134,15 +134,44 @@ def resolve_arrayrecord_paths(data_pattern):
 
 
 def load_host_vae():
-    log_stage("Importing diffusers AutoencoderKL with TensorFlow disabled")
-    from diffusers.models import AutoencoderKL
+    log_stage("Importing diffusers FlaxAutoencoderKL with TensorFlow disabled")
+    from diffusers import FlaxAutoencoderKL
 
-    log_stage("Imported diffusers AutoencoderKL")
-    log_stage("Loading VAE on host CPU")
-    vae = AutoencoderKL.from_pretrained("stabilityai/sd-vae-ft-ema")
-    vae.eval()
-    log_stage("Host-side VAE ready")
-    return vae
+    log_stage("Imported diffusers FlaxAutoencoderKL")
+    log_stage("Loading Flax VAE on host CPU")
+    vae, vae_params = FlaxAutoencoderKL.from_pretrained(
+        "stabilityai/sd-vae-ft-ema",
+        dtype=jnp.bfloat16,
+    )
+    cpu_devices = jax.devices("cpu")
+    if not cpu_devices:
+        raise RuntimeError("No CPU backend is available for host-side VAE decoding.")
+    log_stage("Host-side Flax VAE ready")
+    return {
+        "vae": vae,
+        "params": vae_params,
+        "scale_factor": 0.18215,
+        "shift_factor": 0.0,
+        "cpu_device": cpu_devices[0],
+    }
+
+
+def decode_latents_with_host_vae(host_vae, latents_nchw):
+    latents = np.asarray(latents_nchw, dtype=np.float32)
+    latents = latents / host_vae["scale_factor"] + host_vae["shift_factor"]
+    latents = np.transpose(latents, (0, 2, 3, 1))
+    latents_jax = jax.device_put(
+        jnp.asarray(latents, dtype=jnp.bfloat16),
+        host_vae["cpu_device"],
+    )
+    images = host_vae["vae"].apply(
+        {"params": host_vae["params"]},
+        latents_jax,
+        method=host_vae["vae"].decode,
+    ).sample
+    images = np.asarray(jax.device_get(images), dtype=np.float32)
+    images = np.clip((images + 1.0) / 2.0, 0.0, 1.0)
+    return images
 
 
 DIT_VARIANTS = {
@@ -513,19 +542,17 @@ class AsyncFIDWorker:
             p2=2,
             c=4,
         )
-        latents = torch.from_numpy(latents).float() / self.scale_factor
-        with torch.no_grad():
-            images = self._ensure_vae().decode(latents).sample
-        return ((images + 1.0) / 2.0).clamp(0, 1)
+        images = decode_latents_with_host_vae(self._ensure_vae(), latents)
+        images = np.transpose(images, (0, 3, 1, 2))
+        return torch.from_numpy(images).float()
 
     def _decode_generated_latents(self, latents):
         import torch
 
         latents = np.asarray(latents, dtype=np.float32)
-        latents = torch.from_numpy(latents).float() / self.scale_factor
-        with torch.no_grad():
-            images = self._ensure_vae().decode(latents).sample
-        return ((images + 1.0) / 2.0).clamp(0, 1)
+        images = decode_latents_with_host_vae(self._ensure_vae(), latents)
+        images = np.transpose(images, (0, 3, 1, 2))
+        return torch.from_numpy(images).float()
 
     def add_real_latents(self, latents):
         if self.failed or self.real_features_ready:
@@ -955,19 +982,10 @@ def main():
                 
                 # Hand over to background worker to pull array to host, decode in PyTorch VAE, and wandb.log
                 def background_decode_and_log(z_dev, classes, target_step):
-                    import torch
-
                     # Blocking device_get ONLY on this temporary background thread
                     z = np.asarray(jax.device_get(z_dev), dtype=np.float32)
-                    z = torch.from_numpy(z)
                     classes = jax.device_get(classes)
-                    
-                    z = z / 0.18215 # Scale factor
-                    with torch.no_grad():
-                        images = sample_vae.decode(z).sample
-                        
-                    images = (images + 1.0) / 2.0
-                    images = images.clamp(0, 1).permute(0, 2, 3, 1).numpy()
+                    images = decode_latents_with_host_vae(sample_vae, z)
                     images = (images * 255).astype(np.uint8)
                     
                     safe_wandb_log({
