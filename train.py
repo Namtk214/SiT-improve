@@ -1,6 +1,7 @@
 import os
 import sys
 import argparse
+import glob
 import pickle
 import time
 import threading
@@ -85,6 +86,47 @@ def probe_vfio_owners():
     log_stage(
         "If TPU init still fails with 'Device or resource busy', kill the owning PID(s) "
         "or restart the kernel/runtime before retrying."
+    )
+
+
+def resolve_arrayrecord_paths(data_pattern):
+    expanded_pattern = os.path.expanduser(data_pattern)
+    if os.path.isdir(expanded_pattern):
+        directory_pattern = os.path.join(expanded_pattern, "*.ar")
+        matched_paths = sorted(
+            path for path in glob.glob(directory_pattern)
+            if os.path.isfile(path)
+        )
+        if matched_paths:
+            log_stage(
+                f"Resolved ArrayRecord directory '{data_pattern}' to {len(matched_paths)} file(s). "
+                f"First file: {matched_paths[0]}"
+            )
+            return matched_paths
+        raise FileNotFoundError(
+            f"Directory exists but contains no '.ar' files: {data_pattern}"
+        )
+
+    matched_paths = sorted(
+        path for path in glob.glob(expanded_pattern)
+        if os.path.isfile(path)
+    )
+    if matched_paths:
+        log_stage(
+            f"Resolved ArrayRecord pattern '{data_pattern}' to {len(matched_paths)} file(s). "
+            f"First file: {matched_paths[0]}"
+        )
+        return matched_paths
+
+    if os.path.isfile(expanded_pattern):
+        log_stage(f"Using single ArrayRecord file: {expanded_pattern}")
+        return [expanded_pattern]
+
+    raise FileNotFoundError(
+        "No ArrayRecord files matched the provided path/pattern: "
+        f"{data_pattern}. Grain does not expand shell wildcards for you, so "
+        "the path must exist exactly or the glob must be expanded in Python. "
+        "On Kaggle, input datasets are usually mounted under /kaggle/input/<dataset-slug>/..."
     )
 
 
@@ -274,7 +316,8 @@ def get_arrayrecord_dataloader(data_pattern, batch_size, is_training=True, seed=
     """
     Creates an optimized Grain dataloader reading from ArrayRecord files.
     """
-    data_source = grain.ArrayRecordDataSource(data_pattern)
+    input_paths = resolve_arrayrecord_paths(data_pattern)
+    data_source = grain.ArrayRecordDataSource(input_paths)
     
     class ParseAndTokenizeLatents(grain.MapTransform):
         def map(self, record_bytes):
