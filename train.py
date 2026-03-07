@@ -33,6 +33,9 @@ def _collect_vfio_probe_output(device_path):
     if shutil.which("fuser"):
         commands.append(["fuser", "-v", device_path])
 
+    if not commands:
+        return ["<probe tools unavailable: neither 'lsof' nor 'fuser' was found>"]
+
     results = []
     for command in commands:
         try:
@@ -171,7 +174,6 @@ def create_train_state(rng, config, learning_rate):
     )
 
 
-@functools.partial(jax.pmap, axis_name="batch")
 def train_step(state, batch, rng):
     """Executes a single distributed training step."""
     x, y = batch
@@ -230,7 +232,6 @@ def train_step(state, batch, rng):
     return state, metrics, rng
 
 
-@functools.partial(jax.pmap, axis_name="batch")
 def eval_step(state, batch, rng):
     """Evaluates validation metrics without updating parameters."""
     x, y = batch
@@ -541,7 +542,6 @@ class AsyncFIDWorker:
         self.thread.join()
 
   
-@jax.jit
 def sample_latents_jit(params, class_labels, rng, num_steps=50, cfg_scale=4.0):
     """Generate sample latents on TPU."""
     batch_size = class_labels.shape[0]
@@ -621,6 +621,11 @@ def main():
         probe_vfio_owners()
         raise
     log_stage(f"jax.device_count() returned {num_devices}")
+    log_stage("Creating JAX-transformed step functions")
+    pmapped_train_step = functools.partial(jax.pmap, axis_name="batch")(train_step)
+    pmapped_eval_step = functools.partial(jax.pmap, axis_name="batch")(eval_step)
+    sample_latents_jitted = jax.jit(sample_latents_jit)
+    log_stage("Created JAX-transformed step functions")
     if args.batch_size % num_devices != 0:
         raise ValueError(f"--batch-size ({args.batch_size}) must be divisible by the JAX device count ({num_devices})")
     local_batch_size = args.batch_size // num_devices
@@ -734,7 +739,7 @@ def main():
             batch_y = batch_y.reshape(num_devices, local_batch_size)
             
             # Pmap execute step
-            state, metrics, rng = train_step(state, (batch_x, batch_y), rng)
+            state, metrics, rng = pmapped_train_step(state, (batch_x, batch_y), rng)
             global_step += 1
             
             # Periodic Async Logging
@@ -763,7 +768,7 @@ def main():
                         fid_worker.add_real_latents(val_batch[0])
                     val_x = jnp.array(val_batch[0]).reshape(num_devices, local_batch_size, n_patches, patch_dim)
                     val_y = jnp.array(val_batch[1]).reshape(num_devices, local_batch_size)
-                    val_metrics, rng = eval_step(state, (val_x, val_y), rng)
+                    val_metrics, rng = pmapped_eval_step(state, (val_x, val_y), rng)
                     host_val_metrics = replicated_metrics_to_host(val_metrics)
                     for key, value in host_val_metrics.items():
                         metric_sums[key] = metric_sums.get(key, 0.0) + value
@@ -789,7 +794,7 @@ def main():
                         args.num_fid_samples - batch_index * fid_batch_size,
                     )
                     sample_classes = jax.random.randint(sample_rng, (current_batch_size,), 0, 1000)
-                    fake_latents.append(sample_latents_jit(single_params, sample_classes, sample_rng))
+                    fake_latents.append(sample_latents_jitted(single_params, sample_classes, sample_rng))
 
                 rng = rng.at[0].set(sample_rng_base)
                 fid_worker.compute_fid(fake_latents, global_step)
@@ -806,7 +811,7 @@ def main():
                 single_params = jax.tree_util.tree_map(lambda w: w[0], state.params)
                 
                 # Generate latents asynchronously via JIT
-                latents_dev = sample_latents_jit(single_params, sample_classes, sample_rng)
+                latents_dev = sample_latents_jitted(single_params, sample_classes, sample_rng)
                 
                 # Hand over to background worker to pull array to host, decode in PyTorch VAE, and wandb.log
                 def background_decode_and_log(z_dev, classes, target_step):
