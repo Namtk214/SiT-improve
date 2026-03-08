@@ -64,9 +64,7 @@ def load_vae(vae_model="stabilityai/sd-vae-ft-ema"):
     Assumption: scaling_factor from vae.config is 0.18215 for this model,
     consistent with the SCALE_FACTOR=0.18215 hardcoded in prepare_data_tpu.py.
     """
-    # Import from the narrow diffusers.models namespace. On Kaggle TPU this is
-    # more stable than the top-level diffusers import path used for Flax.
-    from diffusers.models import FlaxAutoencoderKL
+    from diffusers import FlaxAutoencoderKL
     vae, vae_params = FlaxAutoencoderKL.from_pretrained(vae_model, from_pt=True)
     vae_params = jax.device_get(vae_params)
     log_stage(f"VAE loaded: {vae_model!r} (scaling_factor={vae.config.scaling_factor})")
@@ -969,12 +967,21 @@ def main():
             log_stage(f"Validation disabled. {e}")
             val_iterator = None
 
-    # ── VAE: load directly in main process, jit decode on TPU ─────────────────
-    vae_module, vae_params = load_vae(args.vae_model)
-    _vae_decode_jit = _make_vae_decode_fn(vae_module)
+    # ── VAE: lazy init — only loaded when decode is first called ──────────────
+    # Keeps Diffusers/protobuf import out of the startup path so that runs
+    # without preview/FID/preflight never touch the VAE at all.
+    _vae_cache = [None]  # None until first use; then (vae_module, vae_params, decode_jit)
+
+    def ensure_vae_loaded():
+        if _vae_cache[0] is None:
+            log_stage(f"Loading VAE: {args.vae_model!r} (lazy, first decode call)…")
+            vae_module, vae_params = load_vae(args.vae_model)
+            _vae_cache[0] = (vae_module, vae_params, _make_vae_decode_fn(vae_module))
+        return _vae_cache[0]
 
     def decode_latents(latents_nchw):
         """NCHW float32 → NHWC float32 [0, 1].  Runs on TPU via jit."""
+        _, vae_params, _vae_decode_jit = ensure_vae_loaded()
         images = _vae_decode_jit(vae_params, jnp.asarray(latents_nchw))
         return np.asarray(jax.device_get(images), dtype=np.float32)
 
