@@ -54,38 +54,77 @@ def safe_wandb_log(metrics, step=None):
         log_stage(f"WandB logging error: {e}")
 
 
-def load_vae(vae_model="stabilityai/sd-vae-ft-ema"):
-    """Load VAE using PyTorch AutoencoderKL (CPU).
+class VAEDecodeSubprocess:
+    """VAE decode worker running in an isolated child process.
 
-    FlaxAutoencoderKL is deprecated in Diffusers v1.0+ and triggers a
-    protobuf C-extension SIGSEGV on Kaggle TPU v5e at load time.
-    PyTorch CPU decode is crash-free and fast enough for small preview/FID
-    batches (vae_decode_batch_size default = 8).
+    JAX/libtpu and PyTorch each link against libprotobuf but at different
+    versions; loading both in the same process causes a SIGSEGV in
+    protobuf's static initialiser on Kaggle TPU v5e.  Spawning a dedicated
+    child process for VAE decode gives it a clean address space with no
+    JAX/TPU, so the two libprotobuf copies never coexist.
 
-    stabilityai/sd-vae-ft-ema matches prepare_data_tpu.py; scaling_factor=0.18215.
+    The worker is started lazily (first decode call) and stays alive for the
+    lifetime of training, so the VAE model is loaded only once.
+    stabilityai/sd-vae-ft-ema scaling_factor=0.18215 matches prepare_data_tpu.py.
     """
-    import torch
-    from diffusers import AutoencoderKL
-    vae = AutoencoderKL.from_pretrained(vae_model, torch_dtype=torch.float32)
-    vae = vae.eval()
-    log_stage(f"VAE loaded: {vae_model!r} (PyTorch CPU, scaling_factor=0.18215)")
-    return vae
 
+    def __init__(self, vae_model: str):
+        import multiprocessing as mp
+        ctx = mp.get_context("spawn")
+        self._req_q = ctx.Queue()
+        self._res_q = ctx.Queue()
+        self._proc = ctx.Process(
+            target=VAEDecodeSubprocess._worker,
+            args=(vae_model, self._req_q, self._res_q),
+            daemon=True,
+        )
+        self._proc.start()
+        # Block until worker signals ready, or propagate load error
+        ack = self._res_q.get(timeout=180)
+        if ack != "ready":
+            raise RuntimeError(f"VAE worker failed to start: {ack}")
 
-def decode_latents_pt(vae, latents_nchw):
-    """NCHW float32 latents → NHWC float32 [0, 1] via PyTorch CPU decode.
+    @staticmethod
+    def _worker(vae_model, req_q, res_q):
+        """Child-process entry: load VAE once, serve decode requests."""
+        try:
+            import numpy as np
+            import torch
+            from diffusers import AutoencoderKL
+            vae = AutoencoderKL.from_pretrained(
+                vae_model, torch_dtype=torch.float32
+            ).eval()
+            res_q.put("ready")
+        except Exception as exc:
+            res_q.put(f"error: {exc}")
+            return
+        while True:
+            item = req_q.get()
+            if item is None:    # shutdown sentinel
+                return
+            try:
+                with torch.no_grad():
+                    t = torch.from_numpy(item) / 0.18215
+                    imgs = vae.decode(t).sample             # NCHW [-1, 1]
+                    imgs = (imgs / 2.0 + 0.5).clamp(0, 1)
+                    imgs = imgs.permute(0, 2, 3, 1).numpy().astype(np.float32)
+                res_q.put(("ok", imgs))
+            except Exception as exc:
+                res_q.put(("error", str(exc)))
 
-    scaling_factor=0.18215 is hardcoded to match prepare_data_tpu.py and
-    stabilityai/sd-vae-ft-ema.  No JAX/Flax involvement — avoids protobuf
-    conflicts on TPU runtime.
-    """
-    import torch
-    with torch.no_grad():
-        t = torch.from_numpy(np.asarray(latents_nchw, dtype=np.float32)) / 0.18215
-        images = vae.decode(t).sample           # NCHW, range ≈ [-1, 1]
-        images = (images / 2.0 + 0.5).clamp(0.0, 1.0)
-        images = images.permute(0, 2, 3, 1)     # NCHW → NHWC
-    return images.numpy().astype(np.float32)
+    def decode(self, latents_nchw) -> np.ndarray:
+        """NCHW float32 → NHWC float32 [0, 1]."""
+        self._req_q.put(np.asarray(latents_nchw, dtype=np.float32))
+        tag, result = self._res_q.get(timeout=300)
+        if tag != "ok":
+            raise RuntimeError(f"VAE decode subprocess error: {result}")
+        return result
+
+    def shutdown(self):
+        self._req_q.put(None)
+        self._proc.join(timeout=10)
+        if self._proc.is_alive():
+            self._proc.terminate()
 
 
 def resolve_arrayrecord_paths(data_pattern):
@@ -967,20 +1006,21 @@ def main():
             log_stage(f"Validation disabled. {e}")
             val_iterator = None
 
-    # ── VAE: lazy init — only loaded when decode is first called ──────────────
-    # PyTorch CPU decode; avoids FlaxAutoencoderKL protobuf SIGSEGV on TPU.
-    _vae_cache = [None]  # None until first use; then the loaded PyTorch vae module
+    # ── VAE: lazy subprocess worker — spawned only on first decode call ───────
+    # torch/diffusers are loaded exclusively inside the child process, which has
+    # no JAX/TPU in its address space, so the protobuf SIGSEGV cannot occur.
+    _vae_cache = [None]  # None until first use; then VAEDecodeSubprocess instance
 
     def ensure_vae_loaded():
         if _vae_cache[0] is None:
-            log_stage(f"Loading VAE: {args.vae_model!r} (lazy, first decode call)…")
-            _vae_cache[0] = load_vae(args.vae_model)
+            log_stage(f"Spawning VAE decode worker: {args.vae_model!r} …")
+            _vae_cache[0] = VAEDecodeSubprocess(args.vae_model)
+            log_stage("VAE decode worker ready.")
         return _vae_cache[0]
 
     def decode_latents(latents_nchw):
-        """NCHW float32 → NHWC float32 [0, 1]. PyTorch CPU decode."""
-        vae = ensure_vae_loaded()
-        return decode_latents_pt(vae, latents_nchw)
+        """NCHW float32 → NHWC float32 [0, 1]. Decoded in isolated subprocess."""
+        return ensure_vae_loaded().decode(latents_nchw)
 
     def decode_latents_batched(latents_nchw, decode_batch_size=None):
         """Decode latents in small chunks to avoid VAE OOM on TPU."""
@@ -1280,6 +1320,8 @@ def main():
         target=unreplicated_ema,
         step=global_step,
     )
+    if _vae_cache[0] is not None:
+        _vae_cache[0].shutdown()
     logger.shutdown()
 
 
