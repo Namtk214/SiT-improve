@@ -355,7 +355,7 @@ def run_encoding(
     output_dir,
     batch_size=128,
     num_shards=256,
-    vae_model="stabilityai/sd-vae-ft-mse",
+    vae_model="stabilityai/sd-vae-ft-ema",
     group_size=1,
     vae_cache=None,
 ):
@@ -454,7 +454,7 @@ def run_multi_split_encoding(
     output_dir,
     batch_size=128,
     num_shards=256,
-    vae_model="stabilityai/sd-vae-ft-mse",
+    vae_model="stabilityai/sd-vae-ft-ema",
     group_size=1,
     vae_cache=None,
 ):
@@ -484,7 +484,7 @@ def main():
     parser.add_argument("--batch-size", type=int, default=128, help="Global batch size (mutiple of 8)")
     parser.add_argument("--num-shards", type=int, default=1024, help="Number of .ar shards")
     parser.add_argument("--group-size", type=int, default=1, help="ArrayRecord group_size to write. Use 1 for Grain training.")
-    parser.add_argument("--vae-model", type=str, default="stabilityai/sd-vae-ft-mse", help="HF VAE")
+    parser.add_argument("--vae-model", type=str, default="stabilityai/sd-vae-ft-ema", help="HF VAE")
     parser.add_argument(
         "--vae-cache",
         type=str,
