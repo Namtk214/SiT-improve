@@ -217,12 +217,12 @@ def _build_flax_vae_decode_fn(vae_model_path, num_devices, hf_config_id="stabili
         log_stage("[VAE-TPU] Không tìm thấy .msgpack hay .zip, fallback về CPU subprocess.")
         return None, None
 
-    try:
-        from diffusers.models import FlaxAutoencoderKL
-        import flax.serialization
-    except ImportError as e:
-        log_stage(f"[VAE-TPU] diffusers/flax không có sẵn ({e}), fallback về CPU subprocess.")
+    if not _FLAX_VAE_AVAILABLE:
+        log_stage("[VAE-TPU] diffusers/FlaxAutoencoderKL không có sẵn, fallback về CPU subprocess.")
         return None, None
+
+    import flax.serialization
+    FlaxAutoencoderKL = _FlaxAutoencoderKL
 
     # Config: ưu tiên local config.json, fallback về HF Hub (chỉ tải ~1KB)
     def _get_vae_config():
@@ -352,6 +352,16 @@ def build_model_config(model_size):
         compatibility_mode=True,
     )
 
+
+# diffusers phải được import TRƯỚC jax để tránh xung đột C++ protobuf descriptor.
+# Nếu diffusers được import sau khi JAX/TPU khởi tạo, dynamic linker dlopen một .so
+# mới đăng ký protobuf descriptor trùng với descriptor của XLA → SIGSEGV.
+try:
+    from diffusers.models import FlaxAutoencoderKL as _FlaxAutoencoderKL
+    _FLAX_VAE_AVAILABLE = True
+except Exception:
+    _FlaxAutoencoderKL = None
+    _FLAX_VAE_AVAILABLE = False
 
 import jax
 import jax.numpy as jnp
