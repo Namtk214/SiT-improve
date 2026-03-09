@@ -298,8 +298,8 @@ def run_encoding(
     data_dir,
     output_dir,
     batch_size=128,
-    num_shards=1024,
-    vae_model="stabilityai/sd-vae-ft-ema",
+    num_shards=256,
+    vae_model="stabilityai/sd-vae-ft-mse",
     group_size=1,
 ):
     validate_dependencies()
