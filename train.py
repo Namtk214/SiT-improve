@@ -413,7 +413,7 @@ try:
 except ImportError:
     grain = None
 from src.model import SelfFlowDiT
-from src.activation_decomposition import compute_aux_losses
+from src.activation_decomposition import compute_aux_losses, SPATIAL_OFFSET_METRIC_NAMES
 from src.sampling import denoise_loop
 from src.metrics import (
     ReservoirSampler,
@@ -509,6 +509,9 @@ def _zero_aux_metrics(dtype):
         "loss_common": zero,
         "loss_spatial": zero,
         "loss_private": zero,
+        "spatial_offset_losses": {
+            name: zero for name in SPATIAL_OFFSET_METRIC_NAMES
+        },
         "norm_common": zero,
         "avg_private_norm": zero,
         "avg_pairwise_private_cosine": zero,
@@ -532,6 +535,7 @@ def train_step(
     state, ema_params, batch, rng, ema_decay,
     lambda_common=0.0, lambda_spatial=0.0, lambda_private=0.0,
     disable_common_loss=False, reverse_common_loss=False,
+    private_max_pairs=0,
 ):
     """Vanilla SiT training step (global timestep; velocity prediction).
 
@@ -549,7 +553,7 @@ def train_step(
     )
     use_aux_losses = any(weight != 0.0 for weight in (common_weight, lambda_spatial, lambda_private))
 
-    rng, tau_rng, noise_rng, drop_rng = jax.random.split(rng, 4)
+    rng, tau_rng, noise_rng, drop_rng, private_pair_rng = jax.random.split(rng, 5)
 
     tau = jax.random.uniform(tau_rng, shape=(local_batch,), minval=0.0, maxval=1.0)  # [B]
     x1 = jax.random.normal(noise_rng, x0.shape)  # [B, N, D]
@@ -569,7 +573,12 @@ def train_step(
         )
         if use_aux_losses:
             pred, activations = outputs
-            aux_metrics = compute_aux_losses(activations, spatial_target=x0)
+            aux_metrics = compute_aux_losses(
+                activations,
+                spatial_target=x0,
+                private_pair_rng=private_pair_rng,
+                private_max_pairs=private_max_pairs,
+            )
         else:
             pred = outputs
             aux_metrics = _zero_aux_metrics(target.dtype)
@@ -593,6 +602,7 @@ def train_step(
             l_common,
             l_spatial,
             l_private,
+            aux_metrics["spatial_offset_losses"],
             aux_metrics["norm_common"],
             aux_metrics["avg_private_norm"],
             aux_metrics["avg_pairwise_private_cosine"],
@@ -608,6 +618,7 @@ def train_step(
             l_common,
             l_spatial,
             l_private,
+            spatial_offset_losses,
             norm_common,
             avg_private_norm,
             avg_pairwise_private_cosine,
@@ -621,6 +632,7 @@ def train_step(
     l_common = jax.lax.pmean(l_common, axis_name="batch")
     l_spatial = jax.lax.pmean(l_spatial, axis_name="batch")
     l_private = jax.lax.pmean(l_private, axis_name="batch")
+    spatial_offset_losses = jax.lax.pmean(spatial_offset_losses, axis_name="batch")
     norm_common = jax.lax.pmean(norm_common, axis_name="batch")
     avg_private_norm = jax.lax.pmean(avg_private_norm, axis_name="batch")
     avg_pairwise_private_cosine = jax.lax.pmean(avg_pairwise_private_cosine, axis_name="batch")
@@ -647,6 +659,8 @@ def train_step(
         "train/v_abs_mean": v_abs,
         "train/v_pred_abs_mean": v_pred,
     }
+    for name, value in spatial_offset_losses.items():
+        metrics[f"train/l_{name}"] = value
     return state, ema_params, metrics, rng
 
 
@@ -654,6 +668,7 @@ def eval_step(
     state, ema_params, batch, rng,
     lambda_common=0.0, lambda_spatial=0.0, lambda_private=0.0,
     disable_common_loss=False, reverse_common_loss=False,
+    private_max_pairs=0,
 ):
     """Vanilla SiT validation step (mirrors train_step; no grads; no EMA teacher)."""
     x0, y = batch
@@ -665,7 +680,7 @@ def eval_step(
     )
     use_aux_losses = any(weight != 0.0 for weight in (common_weight, lambda_spatial, lambda_private))
 
-    rng, tau_rng, noise_rng = jax.random.split(rng, 3)
+    rng, tau_rng, noise_rng, private_pair_rng = jax.random.split(rng, 4)
 
     tau = jax.random.uniform(tau_rng, shape=(local_batch,), minval=0.0, maxval=1.0)
     x1 = jax.random.normal(noise_rng, x0.shape)
@@ -683,7 +698,12 @@ def eval_step(
     )
     if use_aux_losses:
         pred, activations = outputs
-        aux_metrics = compute_aux_losses(activations, spatial_target=x0)
+        aux_metrics = compute_aux_losses(
+            activations,
+            spatial_target=x0,
+            private_pair_rng=private_pair_rng,
+            private_max_pairs=private_max_pairs,
+        )
     else:
         pred = outputs
         aux_metrics = _zero_aux_metrics(target.dtype)
@@ -692,6 +712,7 @@ def eval_step(
     l_common = aux_metrics["loss_common"]
     l_spatial = aux_metrics["loss_spatial"]
     l_private = aux_metrics["loss_private"]
+    spatial_offset_losses = aux_metrics["spatial_offset_losses"]
     loss = (
         l_diff
         + common_weight * l_common
@@ -706,6 +727,7 @@ def eval_step(
     l_common = jax.lax.pmean(l_common, axis_name="batch")
     l_spatial = jax.lax.pmean(l_spatial, axis_name="batch")
     l_private = jax.lax.pmean(l_private, axis_name="batch")
+    spatial_offset_losses = jax.lax.pmean(spatial_offset_losses, axis_name="batch")
     common_norm = jax.lax.pmean(aux_metrics["norm_common"], axis_name="batch")
     avg_private_norm = jax.lax.pmean(aux_metrics["avg_private_norm"], axis_name="batch")
     avg_pairwise_private_cosine = jax.lax.pmean(aux_metrics["avg_pairwise_private_cosine"], axis_name="batch")
@@ -724,6 +746,8 @@ def eval_step(
         "val/v_abs_mean": v_abs_mean,
         "val/v_pred_abs_mean": v_pred_abs_mean,
     }
+    for name, value in spatial_offset_losses.items():
+        metrics[f"val/l_{name}"] = value
     return metrics, rng
 
 
@@ -1216,6 +1240,8 @@ def main():
                         help="Weight for spatial Gram-matrix auxiliary loss.")
     parser.add_argument("--lambda-private", type=float, default=0.0,
                         help="Weight for private diversity auxiliary loss.")
+    parser.add_argument("--private-max-pairs", type=int, default=0,
+                        help="If > 0, randomly sample at most this many layer pairs per iteration for L_private.")
     # ── VAE model (must match the variant used in prepare_data_tpu.py) ──────
     parser.add_argument(
         "--vae-model",
@@ -1365,6 +1391,8 @@ def main():
         raise ValueError("--vae-decode-batch-size must be greater than 0")
     if args.disable_common_loss and args.reverse_common_loss:
         raise ValueError("--disable-common-loss and --reverse-common-loss are mutually exclusive")
+    if args.private_max_pairs < 0:
+        raise ValueError("--private-max-pairs must be >= 0")
 
     # ── Device initialisation ─────────────────────────────────────────────────
     _tpu_init_attempts = 3
@@ -1404,7 +1432,8 @@ def main():
         f"disable_common_loss={args.disable_common_loss} "
         f"reverse_common_loss={args.reverse_common_loss} "
         f"lambda_spatial={args.lambda_spatial} "
-        f"lambda_private={args.lambda_private}"
+        f"lambda_private={args.lambda_private} "
+        f"private_max_pairs={args.private_max_pairs}"
     )
 
     # ── WandB ─────────────────────────────────────────────────────────────────
@@ -1452,6 +1481,7 @@ def main():
             reverse_common_loss=args.reverse_common_loss,
             lambda_spatial=args.lambda_spatial,
             lambda_private=args.lambda_private,
+            private_max_pairs=args.private_max_pairs,
         ),
         axis_name="batch",
     )
@@ -1463,6 +1493,7 @@ def main():
             reverse_common_loss=args.reverse_common_loss,
             lambda_spatial=args.lambda_spatial,
             lambda_private=args.lambda_private,
+            private_max_pairs=args.private_max_pairs,
         ),
         axis_name="batch",
     )
