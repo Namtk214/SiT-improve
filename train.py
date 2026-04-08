@@ -515,9 +515,23 @@ def _zero_aux_metrics(dtype):
     }
 
 
+def _resolve_common_loss_weight(
+    lambda_common,
+    disable_common_loss=False,
+    reverse_common_loss=False,
+):
+    """Map ablation flags to the effective common-loss coefficient."""
+    if disable_common_loss:
+        return 0.0
+    if reverse_common_loss:
+        return -float(lambda_common)
+    return float(lambda_common)
+
+
 def train_step(
     state, ema_params, batch, rng, ema_decay,
     lambda_common=0.0, lambda_spatial=0.0, lambda_private=0.0,
+    disable_common_loss=False, reverse_common_loss=False,
 ):
     """Vanilla SiT training step (global timestep; velocity prediction).
 
@@ -528,7 +542,12 @@ def train_step(
     """
     x0, y = batch  # x0: [local_B, N, D], y: [local_B]
     local_batch = x0.shape[0]
-    use_aux_losses = any(weight != 0.0 for weight in (lambda_common, lambda_spatial, lambda_private))
+    common_weight = _resolve_common_loss_weight(
+        lambda_common,
+        disable_common_loss=disable_common_loss,
+        reverse_common_loss=reverse_common_loss,
+    )
+    use_aux_losses = any(weight != 0.0 for weight in (common_weight, lambda_spatial, lambda_private))
 
     rng, tau_rng, noise_rng, drop_rng = jax.random.split(rng, 4)
 
@@ -561,7 +580,7 @@ def train_step(
         l_private = aux_metrics["loss_private"]
         loss = (
             l_diff
-            + lambda_common * l_common
+            + common_weight * l_common
             + lambda_spatial * l_spatial
             + lambda_private * l_private
         )
@@ -634,11 +653,17 @@ def train_step(
 def eval_step(
     state, ema_params, batch, rng,
     lambda_common=0.0, lambda_spatial=0.0, lambda_private=0.0,
+    disable_common_loss=False, reverse_common_loss=False,
 ):
     """Vanilla SiT validation step (mirrors train_step; no grads; no EMA teacher)."""
     x0, y = batch
     local_batch = x0.shape[0]
-    use_aux_losses = any(weight != 0.0 for weight in (lambda_common, lambda_spatial, lambda_private))
+    common_weight = _resolve_common_loss_weight(
+        lambda_common,
+        disable_common_loss=disable_common_loss,
+        reverse_common_loss=reverse_common_loss,
+    )
+    use_aux_losses = any(weight != 0.0 for weight in (common_weight, lambda_spatial, lambda_private))
 
     rng, tau_rng, noise_rng = jax.random.split(rng, 3)
 
@@ -669,7 +694,7 @@ def eval_step(
     l_private = aux_metrics["loss_private"]
     loss = (
         l_diff
-        + lambda_common * l_common
+        + common_weight * l_common
         + lambda_spatial * l_spatial
         + lambda_private * l_private
     )
@@ -1183,6 +1208,10 @@ def main():
                         help="Gradient clip max_norm (paper: 1.0)")
     parser.add_argument("--lambda-common", type=float, default=0.0,
                         help="Weight for common alignment auxiliary loss.")
+    parser.add_argument("--disable-common-loss", action="store_true",
+                        help="Ablation: disable the common alignment loss term.")
+    parser.add_argument("--reverse-common-loss", action="store_true",
+                        help="Ablation: reverse the common alignment objective to push A_i away from A.")
     parser.add_argument("--lambda-spatial", type=float, default=0.0,
                         help="Weight for spatial Gram-matrix auxiliary loss.")
     parser.add_argument("--lambda-private", type=float, default=0.0,
@@ -1334,6 +1363,8 @@ def main():
         raise ValueError("--block-corr-batches must be > 0")
     if args.vae_decode_batch_size <= 0:
         raise ValueError("--vae-decode-batch-size must be greater than 0")
+    if args.disable_common_loss and args.reverse_common_loss:
+        raise ValueError("--disable-common-loss and --reverse-common-loss are mutually exclusive")
 
     # ── Device initialisation ─────────────────────────────────────────────────
     _tpu_init_attempts = 3
@@ -1370,6 +1401,8 @@ def main():
     log_stage(
         "Activation decomposition: "
         f"lambda_common={args.lambda_common} "
+        f"disable_common_loss={args.disable_common_loss} "
+        f"reverse_common_loss={args.reverse_common_loss} "
         f"lambda_spatial={args.lambda_spatial} "
         f"lambda_private={args.lambda_private}"
     )
@@ -1415,6 +1448,8 @@ def main():
         partial(
             train_step,
             lambda_common=args.lambda_common,
+            disable_common_loss=args.disable_common_loss,
+            reverse_common_loss=args.reverse_common_loss,
             lambda_spatial=args.lambda_spatial,
             lambda_private=args.lambda_private,
         ),
@@ -1424,6 +1459,8 @@ def main():
         partial(
             eval_step,
             lambda_common=args.lambda_common,
+            disable_common_loss=args.disable_common_loss,
+            reverse_common_loss=args.reverse_common_loss,
             lambda_spatial=args.lambda_spatial,
             lambda_private=args.lambda_private,
         ),

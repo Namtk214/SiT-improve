@@ -69,10 +69,7 @@ def compute_aux_losses(
 
     gram_common = gram_matrix(common)
     gram_target = gram_matrix(spatial_target)
-    num_tokens = common.shape[1]
-    spatial_loss = jnp.mean(jnp.square(gram_common - gram_target)) / jnp.square(
-        jnp.asarray(num_tokens, dtype=common.dtype)
-    )
+    spatial_loss = jnp.mean(jnp.square(gram_common - gram_target))
 
     private_loss = _mean_pairwise_cosine_squared(private)
 
