@@ -8,10 +8,7 @@ from typing import Any
 import jax
 import jax.numpy as jnp
 
-LOCAL_SPATIAL_OFFSETS = ((1, 0), (0, 1), (1, 1), (2, 0), (0, 2))
-SPATIAL_OFFSET_METRIC_NAMES = tuple(
-    f"spatial_offset_dy{dy}_dx{dx}" for dy, dx in LOCAL_SPATIAL_OFFSETS
-)
+DEFAULT_SPATIAL_WINDOW_SIZE = 3
 
 
 def collect_activations(activations: Any) -> jax.Array:
@@ -46,10 +43,6 @@ def gram_matrix(x: jax.Array) -> jax.Array:
     return jnp.einsum("bnd,bmd->bnm", x, x)
 
 
-def _offset_metric_name(dy: int, dx: int) -> str:
-    return f"spatial_offset_dy{dy}_dx{dx}"
-
-
 def tokens_to_grid(x: jax.Array) -> jax.Array:
     """Reshape `[B, N, C]` tokens into a square spatial grid `[B, H, W, C]`."""
     if x.ndim != 3:
@@ -61,59 +54,57 @@ def tokens_to_grid(x: jax.Array) -> jax.Array:
     return x.reshape(batch, grid_size, grid_size, channels)
 
 
-def shifted_overlap_slices(height: int, width: int, dy: int, dx: int):
-    """Return overlapping source/shifted slices for a 2D offset."""
-    if abs(dy) >= height or abs(dx) >= width:
-        return None
-
-    if dy >= 0:
-        src_h = slice(0, height - dy)
-        dst_h = slice(dy, height)
-    else:
-        src_h = slice(-dy, height)
-        dst_h = slice(0, height + dy)
-
-    if dx >= 0:
-        src_w = slice(0, width - dx)
-        dst_w = slice(dx, width)
-    else:
-        src_w = slice(-dx, width)
-        dst_w = slice(0, width + dx)
-
-    return src_h, src_w, dst_h, dst_w
-
-
 def _normalize_channels(x: jax.Array, eps: float = 1e-8) -> jax.Array:
     return x / jnp.maximum(jnp.linalg.norm(x, axis=-1, keepdims=True), eps)
 
 
-def local_cosine_similarity(
+def extract_sliding_windows(
     grid: jax.Array,
-    dy: int,
-    dx: int,
-    eps: float = 1e-8,
-) -> jax.Array | None:
-    """Compute cosine similarity map for one local offset."""
+    window_size: int,
+) -> jax.Array:
+    """Extract all valid sliding windows as `[B, num_windows, window_area, C]`."""
     if grid.ndim != 4:
         raise ValueError(f"Expected a spatial grid with rank 4, got shape {grid.shape}")
+    if window_size <= 0:
+        raise ValueError(f"Window size must be positive, got {window_size}")
 
-    overlap = shifted_overlap_slices(grid.shape[1], grid.shape[2], dy, dx)
-    if overlap is None:
-        return None
+    batch, height, width, channels = grid.shape
+    if window_size > height or window_size > width:
+        raise ValueError(
+            f"Window size {window_size} exceeds grid size {(height, width)}"
+        )
 
-    src_h, src_w, dst_h, dst_w = overlap
-    source = _normalize_channels(grid[:, src_h, src_w, :], eps=eps)
-    shifted = _normalize_channels(grid[:, dst_h, dst_w, :], eps=eps)
-    return jnp.sum(source * shifted, axis=-1)
+    out_h = height - window_size + 1
+    out_w = width - window_size + 1
+    window_tokens = []
+    for dy in range(window_size):
+        for dx in range(window_size):
+            window_tokens.append(grid[:, dy:dy + out_h, dx:dx + out_w, :])
+
+    stacked = jnp.stack(window_tokens, axis=3)  # [B, out_h, out_w, window_area, C]
+    return stacked.reshape(batch, out_h * out_w, window_size * window_size, channels)
 
 
-def local_self_similarity_loss(
+def window_gram_matrix(
+    window_tokens: jax.Array,
+    eps: float = 1e-8,
+) -> jax.Array:
+    """Compute normalized local Gram matrices for `[B, W, M, C]` window tokens."""
+    if window_tokens.ndim != 4:
+        raise ValueError(
+            f"Expected window tokens with rank 4, got shape {window_tokens.shape}"
+        )
+    normalized = _normalize_channels(window_tokens, eps=eps)
+    return jnp.einsum("bwmc,bwnc->bwmn", normalized, normalized)
+
+
+def local_window_gram_loss(
     feature_tokens: jax.Array,
     target_tokens: jax.Array,
-    offsets: tuple[tuple[int, int], ...] = LOCAL_SPATIAL_OFFSETS,
+    window_size: int = DEFAULT_SPATIAL_WINDOW_SIZE,
     eps: float = 1e-8,
 ) -> tuple[jax.Array, dict[str, jax.Array]]:
-    """Compare local cosine self-similarity maps between feature and target tokens."""
+    """Compare local Gram structure between feature and target sliding windows."""
     feature_grid = tokens_to_grid(feature_tokens)
     target_grid = tokens_to_grid(target_tokens)
     if feature_grid.shape[:3] != target_grid.shape[:3]:
@@ -122,24 +113,18 @@ def local_self_similarity_loss(
             f"got {feature_grid.shape[:3]} vs {target_grid.shape[:3]}"
         )
 
-    zero = jnp.array(0.0, dtype=feature_tokens.dtype)
-    offset_losses = {name: zero for name in SPATIAL_OFFSET_METRIC_NAMES}
-    valid_losses = []
+    feature_windows = extract_sliding_windows(feature_grid, window_size)
+    target_windows = extract_sliding_windows(target_grid, window_size)
+    feature_grams = window_gram_matrix(feature_windows, eps=eps)
+    target_grams = window_gram_matrix(target_windows, eps=eps)
 
-    for dy, dx in offsets:
-        feature_similarity = local_cosine_similarity(feature_grid, dy, dx, eps=eps)
-        target_similarity = local_cosine_similarity(target_grid, dy, dx, eps=eps)
-        if feature_similarity is None or target_similarity is None:
-            continue
-
-        offset_loss = jnp.mean(jnp.abs(feature_similarity - target_similarity))
-        offset_losses[_offset_metric_name(dy, dx)] = offset_loss
-        valid_losses.append(offset_loss)
-
-    if not valid_losses:
-        return zero, offset_losses
-
-    return jnp.mean(jnp.stack(valid_losses)), offset_losses
+    window_losses = jnp.mean(jnp.abs(feature_grams - target_grams), axis=(-2, -1))
+    spatial_loss = jnp.mean(window_losses)
+    spatial_metrics = {
+        "spatial_num_windows": jnp.asarray(feature_windows.shape[1], dtype=feature_tokens.dtype),
+        "spatial_window_area": jnp.asarray(feature_windows.shape[2], dtype=feature_tokens.dtype),
+    }
+    return spatial_loss, spatial_metrics
 
 
 def _pairwise_cosines(private: jax.Array, eps: float = 1e-8) -> jax.Array:
@@ -181,6 +166,7 @@ def compute_aux_losses(
     spatial_target: jax.Array,
     private_pair_rng: jax.Array | None = None,
     private_max_pairs: int = 0,
+    spatial_window_size: int = DEFAULT_SPATIAL_WINDOW_SIZE,
 ) -> dict[str, jax.Array]:
     """Compute auxiliary losses and logging metrics for activation decomposition."""
     activations = collect_activations(activations)
@@ -190,7 +176,11 @@ def compute_aux_losses(
     common, common_anchor, private = compute_common_private(activations)
     common_loss = jnp.mean(jnp.square(activations - common_anchor[None, ...]))
 
-    spatial_loss, spatial_offset_losses = local_self_similarity_loss(common, spatial_target)
+    spatial_loss, spatial_metrics = local_window_gram_loss(
+        common,
+        spatial_target,
+        window_size=spatial_window_size,
+    )
 
     private_loss = _mean_pairwise_cosine_squared(
         private,
@@ -214,7 +204,7 @@ def compute_aux_losses(
         "loss_common": common_loss,
         "loss_spatial": spatial_loss,
         "loss_private": private_loss,
-        "spatial_offset_losses": spatial_offset_losses,
+        "spatial_metrics": spatial_metrics,
         "norm_common": common_norm,
         "avg_private_norm": avg_private_norm,
         "avg_pairwise_private_cosine": avg_pairwise_cosine,

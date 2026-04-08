@@ -413,7 +413,7 @@ try:
 except ImportError:
     grain = None
 from src.model import SelfFlowDiT
-from src.activation_decomposition import compute_aux_losses, SPATIAL_OFFSET_METRIC_NAMES
+from src.activation_decomposition import compute_aux_losses, DEFAULT_SPATIAL_WINDOW_SIZE
 from src.sampling import denoise_loop
 from src.metrics import (
     ReservoirSampler,
@@ -509,8 +509,9 @@ def _zero_aux_metrics(dtype):
         "loss_common": zero,
         "loss_spatial": zero,
         "loss_private": zero,
-        "spatial_offset_losses": {
-            name: zero for name in SPATIAL_OFFSET_METRIC_NAMES
+        "spatial_metrics": {
+            "spatial_num_windows": zero,
+            "spatial_window_area": zero,
         },
         "norm_common": zero,
         "avg_private_norm": zero,
@@ -536,6 +537,7 @@ def train_step(
     lambda_common=0.0, lambda_spatial=0.0, lambda_private=0.0,
     disable_common_loss=False, reverse_common_loss=False,
     private_max_pairs=0,
+    spatial_window_size=DEFAULT_SPATIAL_WINDOW_SIZE,
 ):
     """Vanilla SiT training step (global timestep; velocity prediction).
 
@@ -578,6 +580,7 @@ def train_step(
                 spatial_target=x0,
                 private_pair_rng=private_pair_rng,
                 private_max_pairs=private_max_pairs,
+                spatial_window_size=spatial_window_size,
             )
         else:
             pred = outputs
@@ -602,7 +605,7 @@ def train_step(
             l_common,
             l_spatial,
             l_private,
-            aux_metrics["spatial_offset_losses"],
+            aux_metrics["spatial_metrics"],
             aux_metrics["norm_common"],
             aux_metrics["avg_private_norm"],
             aux_metrics["avg_pairwise_private_cosine"],
@@ -618,7 +621,7 @@ def train_step(
             l_common,
             l_spatial,
             l_private,
-            spatial_offset_losses,
+            spatial_metrics,
             norm_common,
             avg_private_norm,
             avg_pairwise_private_cosine,
@@ -632,7 +635,7 @@ def train_step(
     l_common = jax.lax.pmean(l_common, axis_name="batch")
     l_spatial = jax.lax.pmean(l_spatial, axis_name="batch")
     l_private = jax.lax.pmean(l_private, axis_name="batch")
-    spatial_offset_losses = jax.lax.pmean(spatial_offset_losses, axis_name="batch")
+    spatial_metrics = jax.lax.pmean(spatial_metrics, axis_name="batch")
     norm_common = jax.lax.pmean(norm_common, axis_name="batch")
     avg_private_norm = jax.lax.pmean(avg_private_norm, axis_name="batch")
     avg_pairwise_private_cosine = jax.lax.pmean(avg_pairwise_private_cosine, axis_name="batch")
@@ -659,8 +662,8 @@ def train_step(
         "train/v_abs_mean": v_abs,
         "train/v_pred_abs_mean": v_pred,
     }
-    for name, value in spatial_offset_losses.items():
-        metrics[f"train/l_{name}"] = value
+    metrics["train/spatial_num_windows"] = spatial_metrics["spatial_num_windows"]
+    metrics["train/spatial_window_area"] = spatial_metrics["spatial_window_area"]
     return state, ema_params, metrics, rng
 
 
@@ -669,6 +672,7 @@ def eval_step(
     lambda_common=0.0, lambda_spatial=0.0, lambda_private=0.0,
     disable_common_loss=False, reverse_common_loss=False,
     private_max_pairs=0,
+    spatial_window_size=DEFAULT_SPATIAL_WINDOW_SIZE,
 ):
     """Vanilla SiT validation step (mirrors train_step; no grads; no EMA teacher)."""
     x0, y = batch
@@ -703,6 +707,7 @@ def eval_step(
             spatial_target=x0,
             private_pair_rng=private_pair_rng,
             private_max_pairs=private_max_pairs,
+            spatial_window_size=spatial_window_size,
         )
     else:
         pred = outputs
@@ -712,7 +717,7 @@ def eval_step(
     l_common = aux_metrics["loss_common"]
     l_spatial = aux_metrics["loss_spatial"]
     l_private = aux_metrics["loss_private"]
-    spatial_offset_losses = aux_metrics["spatial_offset_losses"]
+    spatial_metrics = aux_metrics["spatial_metrics"]
     loss = (
         l_diff
         + common_weight * l_common
@@ -727,7 +732,7 @@ def eval_step(
     l_common = jax.lax.pmean(l_common, axis_name="batch")
     l_spatial = jax.lax.pmean(l_spatial, axis_name="batch")
     l_private = jax.lax.pmean(l_private, axis_name="batch")
-    spatial_offset_losses = jax.lax.pmean(spatial_offset_losses, axis_name="batch")
+    spatial_metrics = jax.lax.pmean(spatial_metrics, axis_name="batch")
     common_norm = jax.lax.pmean(aux_metrics["norm_common"], axis_name="batch")
     avg_private_norm = jax.lax.pmean(aux_metrics["avg_private_norm"], axis_name="batch")
     avg_pairwise_private_cosine = jax.lax.pmean(aux_metrics["avg_pairwise_private_cosine"], axis_name="batch")
@@ -746,8 +751,8 @@ def eval_step(
         "val/v_abs_mean": v_abs_mean,
         "val/v_pred_abs_mean": v_pred_abs_mean,
     }
-    for name, value in spatial_offset_losses.items():
-        metrics[f"val/l_{name}"] = value
+    metrics["val/spatial_num_windows"] = spatial_metrics["spatial_num_windows"]
+    metrics["val/spatial_window_area"] = spatial_metrics["spatial_window_area"]
     return metrics, rng
 
 
@@ -1237,11 +1242,13 @@ def main():
     parser.add_argument("--reverse-common-loss", action="store_true",
                         help="Ablation: reverse the common alignment objective to push A_i away from A.")
     parser.add_argument("--lambda-spatial", type=float, default=0.0,
-                        help="Weight for spatial Gram-matrix auxiliary loss.")
+                        help="Weight for sliding-window local Gram spatial loss.")
     parser.add_argument("--lambda-private", type=float, default=0.0,
                         help="Weight for private diversity auxiliary loss.")
     parser.add_argument("--private-max-pairs", type=int, default=0,
                         help="If > 0, randomly sample at most this many layer pairs per iteration for L_private.")
+    parser.add_argument("--spatial-window-size", type=int, default=DEFAULT_SPATIAL_WINDOW_SIZE,
+                        help="Sliding window size for local Gram spatial loss.")
     # ── VAE model (must match the variant used in prepare_data_tpu.py) ──────
     parser.add_argument(
         "--vae-model",
@@ -1393,6 +1400,8 @@ def main():
         raise ValueError("--disable-common-loss and --reverse-common-loss are mutually exclusive")
     if args.private_max_pairs < 0:
         raise ValueError("--private-max-pairs must be >= 0")
+    if args.spatial_window_size <= 0:
+        raise ValueError("--spatial-window-size must be > 0")
 
     # ── Device initialisation ─────────────────────────────────────────────────
     _tpu_init_attempts = 3
@@ -1433,7 +1442,8 @@ def main():
         f"reverse_common_loss={args.reverse_common_loss} "
         f"lambda_spatial={args.lambda_spatial} "
         f"lambda_private={args.lambda_private} "
-        f"private_max_pairs={args.private_max_pairs}"
+        f"private_max_pairs={args.private_max_pairs} "
+        f"spatial_window_size={args.spatial_window_size}"
     )
 
     # ── WandB ─────────────────────────────────────────────────────────────────
@@ -1482,6 +1492,7 @@ def main():
             lambda_spatial=args.lambda_spatial,
             lambda_private=args.lambda_private,
             private_max_pairs=args.private_max_pairs,
+            spatial_window_size=args.spatial_window_size,
         ),
         axis_name="batch",
     )
@@ -1494,6 +1505,7 @@ def main():
             lambda_spatial=args.lambda_spatial,
             lambda_private=args.lambda_private,
             private_max_pairs=args.private_max_pairs,
+            spatial_window_size=args.spatial_window_size,
         ),
         axis_name="batch",
     )
