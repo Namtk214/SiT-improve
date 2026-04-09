@@ -413,7 +413,11 @@ try:
 except ImportError:
     grain = None
 from src.model import SelfFlowDiT
-from src.activation_decomposition import compute_aux_losses, DEFAULT_SPATIAL_WINDOW_SIZE
+from src.activation_decomposition import (
+    compute_aux_losses,
+    DEFAULT_SPATIAL_WINDOW_SIZE,
+    DEFAULT_SPATIAL_WINDOW_STRIDE,
+)
 from src.sampling import denoise_loop
 from src.metrics import (
     ReservoirSampler,
@@ -523,6 +527,7 @@ def train_step(
     lambda_spatial=0.0, lambda_private=0.0,
     private_max_pairs=0,
     spatial_window_size=DEFAULT_SPATIAL_WINDOW_SIZE,
+    spatial_window_stride=DEFAULT_SPATIAL_WINDOW_STRIDE,
 ):
     """Vanilla SiT training step (global timestep; velocity prediction).
 
@@ -561,6 +566,7 @@ def train_step(
                 private_pair_rng=private_pair_rng,
                 private_max_pairs=private_max_pairs,
                 spatial_window_size=spatial_window_size,
+                spatial_window_stride=spatial_window_stride,
             )
         else:
             pred = outputs
@@ -646,6 +652,7 @@ def eval_step(
     lambda_spatial=0.0, lambda_private=0.0,
     private_max_pairs=0,
     spatial_window_size=DEFAULT_SPATIAL_WINDOW_SIZE,
+    spatial_window_stride=DEFAULT_SPATIAL_WINDOW_STRIDE,
 ):
     """Vanilla SiT validation step (mirrors train_step; no grads; no EMA teacher)."""
     x0, y = batch
@@ -676,6 +683,7 @@ def eval_step(
             private_pair_rng=private_pair_rng,
             private_max_pairs=private_max_pairs,
             spatial_window_size=spatial_window_size,
+            spatial_window_stride=spatial_window_stride,
         )
     else:
         pred = outputs
@@ -1207,6 +1215,8 @@ def main():
                         help="If > 0, randomly sample at most this many layer pairs per iteration for L_private.")
     parser.add_argument("--spatial-window-size", type=int, default=DEFAULT_SPATIAL_WINDOW_SIZE,
                         help="Sliding window size for local Gram spatial loss.")
+    parser.add_argument("--spatial-window-stride", type=int, default=DEFAULT_SPATIAL_WINDOW_STRIDE,
+                        help="Sliding window stride for local Gram spatial loss.")
     # ── VAE model (must match the variant used in prepare_data_tpu.py) ──────
     parser.add_argument(
         "--vae-model",
@@ -1358,6 +1368,8 @@ def main():
         raise ValueError("--private-max-pairs must be >= 0")
     if args.spatial_window_size <= 0:
         raise ValueError("--spatial-window-size must be > 0")
+    if args.spatial_window_stride <= 0:
+        raise ValueError("--spatial-window-stride must be > 0")
 
     # ── Device initialisation ─────────────────────────────────────────────────
     _tpu_init_attempts = 3
@@ -1396,7 +1408,8 @@ def main():
         f"lambda_spatial={args.lambda_spatial} "
         f"lambda_private={args.lambda_private} "
         f"private_max_pairs={args.private_max_pairs} "
-        f"spatial_window_size={args.spatial_window_size}"
+        f"spatial_window_size={args.spatial_window_size} "
+        f"spatial_window_stride={args.spatial_window_stride}"
     )
 
     # ── WandB ─────────────────────────────────────────────────────────────────
@@ -1443,6 +1456,7 @@ def main():
             lambda_private=args.lambda_private,
             private_max_pairs=args.private_max_pairs,
             spatial_window_size=args.spatial_window_size,
+            spatial_window_stride=args.spatial_window_stride,
         ),
         axis_name="batch",
     )
@@ -1453,6 +1467,7 @@ def main():
             lambda_private=args.lambda_private,
             private_max_pairs=args.private_max_pairs,
             spatial_window_size=args.spatial_window_size,
+            spatial_window_stride=args.spatial_window_stride,
         ),
         axis_name="batch",
     )

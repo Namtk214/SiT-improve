@@ -9,6 +9,7 @@ import jax
 import jax.numpy as jnp
 
 DEFAULT_SPATIAL_WINDOW_SIZE = 3
+DEFAULT_SPATIAL_WINDOW_STRIDE = 1
 
 
 def collect_activations(activations: Any) -> jax.Array:
@@ -62,12 +63,15 @@ def _normalize_channels(x: jax.Array, eps: float = 1e-8) -> jax.Array:
 def extract_sliding_windows(
     grid: jax.Array,
     window_size: int,
+    stride: int = DEFAULT_SPATIAL_WINDOW_STRIDE,
 ) -> jax.Array:
     """Extract all valid sliding windows as `[B, num_windows, window_area, C]`."""
     if grid.ndim != 4:
         raise ValueError(f"Expected a spatial grid with rank 4, got shape {grid.shape}")
     if window_size <= 0:
         raise ValueError(f"Window size must be positive, got {window_size}")
+    if stride <= 0:
+        raise ValueError(f"Stride must be positive, got {stride}")
 
     batch, height, width, channels = grid.shape
     if window_size > height or window_size > width:
@@ -75,12 +79,19 @@ def extract_sliding_windows(
             f"Window size {window_size} exceeds grid size {(height, width)}"
         )
 
-    out_h = height - window_size + 1
-    out_w = width - window_size + 1
+    out_h = (height - window_size) // stride + 1
+    out_w = (width - window_size) // stride + 1
     window_tokens = []
     for dy in range(window_size):
         for dx in range(window_size):
-            window_tokens.append(grid[:, dy:dy + out_h, dx:dx + out_w, :])
+            window_tokens.append(
+                grid[
+                    :,
+                    dy:dy + out_h * stride:stride,
+                    dx:dx + out_w * stride:stride,
+                    :,
+                ]
+            )
 
     stacked = jnp.stack(window_tokens, axis=3)  # [B, out_h, out_w, window_area, C]
     return stacked.reshape(batch, out_h * out_w, window_size * window_size, channels)
@@ -103,6 +114,7 @@ def local_window_gram_loss(
     feature_tokens: jax.Array,
     target_tokens: jax.Array,
     window_size: int = DEFAULT_SPATIAL_WINDOW_SIZE,
+    stride: int = DEFAULT_SPATIAL_WINDOW_STRIDE,
     eps: float = 1e-8,
 ) -> tuple[jax.Array, dict[str, jax.Array]]:
     """Compare local Gram structure between feature and target sliding windows."""
@@ -114,8 +126,8 @@ def local_window_gram_loss(
             f"got {feature_grid.shape[:3]} vs {target_grid.shape[:3]}"
         )
 
-    feature_windows = extract_sliding_windows(feature_grid, window_size)
-    target_windows = extract_sliding_windows(target_grid, window_size)
+    feature_windows = extract_sliding_windows(feature_grid, window_size, stride=stride)
+    target_windows = extract_sliding_windows(target_grid, window_size, stride=stride)
     feature_grams = window_gram_matrix(feature_windows, eps=eps)
     target_grams = window_gram_matrix(target_windows, eps=eps)
 
@@ -168,6 +180,7 @@ def compute_aux_losses(
     private_pair_rng: jax.Array | None = None,
     private_max_pairs: int = 0,
     spatial_window_size: int = DEFAULT_SPATIAL_WINDOW_SIZE,
+    spatial_window_stride: int = DEFAULT_SPATIAL_WINDOW_STRIDE,
 ) -> dict[str, jax.Array]:
     """Compute auxiliary losses and logging metrics for activation decomposition."""
     activations = collect_activations(activations)
@@ -180,6 +193,7 @@ def compute_aux_losses(
         common,
         spatial_target,
         window_size=spatial_window_size,
+        stride=spatial_window_stride,
     )
 
     private_loss = _mean_pairwise_cosine_squared(
