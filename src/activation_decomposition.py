@@ -10,6 +10,7 @@ import jax.numpy as jnp
 
 DEFAULT_SPATIAL_WINDOW_SIZE = 3
 DEFAULT_SPATIAL_WINDOW_STRIDE = 1
+DEFAULT_MAX_TIMESTEP_BLUR_SIGMA = 3.0
 
 
 def collect_activations(activations: Any) -> jax.Array:
@@ -58,6 +59,59 @@ def tokens_to_grid(x: jax.Array) -> jax.Array:
 
 def _normalize_channels(x: jax.Array, eps: float = 1e-8) -> jax.Array:
     return x / jnp.maximum(jnp.linalg.norm(x, axis=-1, keepdims=True), eps)
+
+
+def _gaussian_kernel_1d(
+    sigmas: jax.Array,
+    max_sigma: float = DEFAULT_MAX_TIMESTEP_BLUR_SIGMA,
+    truncate: float = 3.0,
+    eps: float = 1e-6,
+) -> jax.Array:
+    """Build normalized per-example 1D Gaussian kernels `[B, K]`."""
+    if sigmas.ndim != 1:
+        raise ValueError(f"Expected sigma vector with rank 1, got shape {sigmas.shape}")
+    radius = max(1, int(math.ceil(truncate * max_sigma)))
+    offsets = jnp.arange(-radius, radius + 1, dtype=sigmas.dtype)
+    safe_sigmas = jnp.maximum(sigmas[:, None], eps)
+    kernels = jnp.exp(-0.5 * jnp.square(offsets[None, :] / safe_sigmas))
+    delta_kernel = (offsets == 0).astype(sigmas.dtype)[None, :]
+    kernels = jnp.where(sigmas[:, None] <= eps, delta_kernel, kernels)
+    return kernels / jnp.sum(kernels, axis=-1, keepdims=True)
+
+
+def _apply_separable_gaussian_blur(
+    grid: jax.Array,
+    sigmas: jax.Array,
+    max_sigma: float = DEFAULT_MAX_TIMESTEP_BLUR_SIGMA,
+) -> jax.Array:
+    """Apply per-example separable Gaussian blur to `[B, H, W, C]` grids."""
+    if grid.ndim != 4:
+        raise ValueError(f"Expected spatial grid with rank 4, got shape {grid.shape}")
+    if sigmas.ndim != 1:
+        raise ValueError(f"Expected sigma vector with rank 1, got shape {sigmas.shape}")
+    if grid.shape[0] != sigmas.shape[0]:
+        raise ValueError(
+            "Grid batch size and sigma batch size must match, "
+            f"got {grid.shape[0]} vs {sigmas.shape[0]}"
+        )
+
+    kernels = _gaussian_kernel_1d(sigmas.astype(grid.dtype), max_sigma=max_sigma)
+    radius = (kernels.shape[-1] - 1) // 2
+    height, width = grid.shape[1:3]
+
+    padded_h = jnp.pad(grid, ((0, 0), (radius, radius), (0, 0), (0, 0)), mode="reflect")
+    stacked_h = jnp.stack(
+        [padded_h[:, idx:idx + height, :, :] for idx in range(kernels.shape[-1])],
+        axis=1,
+    )
+    blurred_h = jnp.sum(stacked_h * kernels[:, :, None, None, None], axis=1)
+
+    padded_w = jnp.pad(blurred_h, ((0, 0), (0, 0), (radius, radius), (0, 0)), mode="reflect")
+    stacked_w = jnp.stack(
+        [padded_w[:, :, idx:idx + width, :] for idx in range(kernels.shape[-1])],
+        axis=1,
+    )
+    return jnp.sum(stacked_w * kernels[:, :, None, None, None], axis=1)
 
 
 def extract_sliding_windows(
@@ -116,6 +170,8 @@ def local_window_gram_loss(
     window_size: int = DEFAULT_SPATIAL_WINDOW_SIZE,
     stride: int = DEFAULT_SPATIAL_WINDOW_STRIDE,
     eps: float = 1e-8,
+    target_blur_sigmas: jax.Array | None = None,
+    target_blur_max_sigma: float = DEFAULT_MAX_TIMESTEP_BLUR_SIGMA,
 ) -> tuple[jax.Array, dict[str, jax.Array]]:
     """Compare local Gram structure between feature and target sliding windows."""
     feature_grid = tokens_to_grid(feature_tokens)
@@ -125,6 +181,12 @@ def local_window_gram_loss(
             "Feature and target grids must match in batch/height/width, "
             f"got {feature_grid.shape[:3]} vs {target_grid.shape[:3]}"
         )
+    if target_blur_sigmas is not None:
+        target_grid = _apply_separable_gaussian_blur(
+            target_grid,
+            target_blur_sigmas,
+            max_sigma=target_blur_max_sigma,
+        )
 
     feature_windows = extract_sliding_windows(feature_grid, window_size, stride=stride)
     target_windows = extract_sliding_windows(target_grid, window_size, stride=stride)
@@ -133,9 +195,15 @@ def local_window_gram_loss(
 
     window_losses = jnp.mean(jnp.abs(feature_grams - target_grams), axis=(-2, -1))
     spatial_loss = jnp.mean(window_losses)
+    blur_sigma_mean = (
+        jnp.mean(target_blur_sigmas.astype(feature_tokens.dtype))
+        if target_blur_sigmas is not None
+        else jnp.array(0.0, dtype=feature_tokens.dtype)
+    )
     spatial_metrics = {
         "spatial_num_windows": jnp.asarray(feature_windows.shape[1], dtype=feature_tokens.dtype),
         "spatial_window_area": jnp.asarray(feature_windows.shape[2], dtype=feature_tokens.dtype),
+        "spatial_blur_sigma_mean": blur_sigma_mean,
     }
     return spatial_loss, spatial_metrics
 
@@ -177,15 +245,31 @@ def _mean_pairwise_cosine_squared(
 def compute_aux_losses(
     activations: Any,
     spatial_target: jax.Array,
+    timesteps: jax.Array | None = None,
     private_pair_rng: jax.Array | None = None,
     private_max_pairs: int = 0,
     spatial_window_size: int = DEFAULT_SPATIAL_WINDOW_SIZE,
     spatial_window_stride: int = DEFAULT_SPATIAL_WINDOW_STRIDE,
+    spatial_blur_by_timestep: bool = False,
+    spatial_blur_max_sigma: float = DEFAULT_MAX_TIMESTEP_BLUR_SIGMA,
 ) -> dict[str, jax.Array]:
     """Compute auxiliary losses and logging metrics for activation decomposition."""
     activations = collect_activations(activations)
     if spatial_target.ndim != 3:
         raise ValueError(f"Expected spatial target with rank 3, got shape {spatial_target.shape}")
+    if spatial_blur_by_timestep:
+        if timesteps is None:
+            raise ValueError("Timesteps are required when timestep-dependent spatial blur is enabled.")
+        if timesteps.ndim != 1:
+            raise ValueError(f"Expected timesteps with rank 1, got shape {timesteps.shape}")
+        if timesteps.shape[0] != spatial_target.shape[0]:
+            raise ValueError(
+                "Timesteps batch size and spatial target batch size must match, "
+                f"got {timesteps.shape[0]} vs {spatial_target.shape[0]}"
+            )
+        blur_sigmas = spatial_blur_max_sigma * jnp.clip(1.0 - timesteps, 0.0, 1.0)
+    else:
+        blur_sigmas = None
 
     common, common_anchor, private = compute_common_private(activations)
 
@@ -194,6 +278,8 @@ def compute_aux_losses(
         spatial_target,
         window_size=spatial_window_size,
         stride=spatial_window_stride,
+        target_blur_sigmas=blur_sigmas,
+        target_blur_max_sigma=spatial_blur_max_sigma,
     )
 
     private_loss = _mean_pairwise_cosine_squared(

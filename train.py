@@ -415,6 +415,7 @@ except ImportError:
 from src.model import SelfFlowDiT
 from src.activation_decomposition import (
     compute_aux_losses,
+    DEFAULT_MAX_TIMESTEP_BLUR_SIGMA,
     DEFAULT_SPATIAL_WINDOW_SIZE,
     DEFAULT_SPATIAL_WINDOW_STRIDE,
 )
@@ -515,6 +516,7 @@ def _zero_aux_metrics(dtype):
         "spatial_metrics": {
             "spatial_num_windows": zero,
             "spatial_window_area": zero,
+            "spatial_blur_sigma_mean": zero,
         },
         "norm_common": zero,
         "avg_private_norm": zero,
@@ -528,6 +530,7 @@ def train_step(
     private_max_pairs=0,
     spatial_window_size=DEFAULT_SPATIAL_WINDOW_SIZE,
     spatial_window_stride=DEFAULT_SPATIAL_WINDOW_STRIDE,
+    spatial_blur_by_timestep=False,
 ):
     """Vanilla SiT training step (global timestep; velocity prediction).
 
@@ -563,10 +566,12 @@ def train_step(
             aux_metrics = compute_aux_losses(
                 activations,
                 spatial_target=x0,
+                timesteps=tau,
                 private_pair_rng=private_pair_rng,
                 private_max_pairs=private_max_pairs,
                 spatial_window_size=spatial_window_size,
                 spatial_window_stride=spatial_window_stride,
+                spatial_blur_by_timestep=spatial_blur_by_timestep,
             )
         else:
             pred = outputs
@@ -644,6 +649,7 @@ def train_step(
     }
     metrics["train/spatial_num_windows"] = spatial_metrics["spatial_num_windows"]
     metrics["train/spatial_window_area"] = spatial_metrics["spatial_window_area"]
+    metrics["train/spatial_blur_sigma_mean"] = spatial_metrics["spatial_blur_sigma_mean"]
     return state, ema_params, metrics, rng
 
 
@@ -653,6 +659,7 @@ def eval_step(
     private_max_pairs=0,
     spatial_window_size=DEFAULT_SPATIAL_WINDOW_SIZE,
     spatial_window_stride=DEFAULT_SPATIAL_WINDOW_STRIDE,
+    spatial_blur_by_timestep=False,
 ):
     """Vanilla SiT validation step (mirrors train_step; no grads; no EMA teacher)."""
     x0, y = batch
@@ -680,10 +687,12 @@ def eval_step(
         aux_metrics = compute_aux_losses(
             activations,
             spatial_target=x0,
+            timesteps=tau,
             private_pair_rng=private_pair_rng,
             private_max_pairs=private_max_pairs,
             spatial_window_size=spatial_window_size,
             spatial_window_stride=spatial_window_stride,
+            spatial_blur_by_timestep=spatial_blur_by_timestep,
         )
     else:
         pred = outputs
@@ -725,6 +734,7 @@ def eval_step(
     }
     metrics["val/spatial_num_windows"] = spatial_metrics["spatial_num_windows"]
     metrics["val/spatial_window_area"] = spatial_metrics["spatial_window_area"]
+    metrics["val/spatial_blur_sigma_mean"] = spatial_metrics["spatial_blur_sigma_mean"]
     return metrics, rng
 
 
@@ -1217,6 +1227,15 @@ def main():
                         help="Sliding window size for local Gram spatial loss.")
     parser.add_argument("--spatial-window-stride", type=int, default=DEFAULT_SPATIAL_WINDOW_STRIDE,
                         help="Sliding window stride for local Gram spatial loss.")
+    parser.add_argument(
+        "--spatial-blur-by-timestep",
+        action="store_true",
+        help=(
+            "Blur the spatial Gram target according to timestep. "
+            f"Uses Gaussian sigma that decreases linearly from {DEFAULT_MAX_TIMESTEP_BLUR_SIGMA} "
+            "at tau=0 (most noisy) to 0 at tau=1 (clean)."
+        ),
+    )
     # ── VAE model (must match the variant used in prepare_data_tpu.py) ──────
     parser.add_argument(
         "--vae-model",
@@ -1409,7 +1428,8 @@ def main():
         f"lambda_private={args.lambda_private} "
         f"private_max_pairs={args.private_max_pairs} "
         f"spatial_window_size={args.spatial_window_size} "
-        f"spatial_window_stride={args.spatial_window_stride}"
+        f"spatial_window_stride={args.spatial_window_stride} "
+        f"spatial_blur_by_timestep={args.spatial_blur_by_timestep}"
     )
 
     # ── WandB ─────────────────────────────────────────────────────────────────
@@ -1457,6 +1477,7 @@ def main():
             private_max_pairs=args.private_max_pairs,
             spatial_window_size=args.spatial_window_size,
             spatial_window_stride=args.spatial_window_stride,
+            spatial_blur_by_timestep=args.spatial_blur_by_timestep,
         ),
         axis_name="batch",
     )
@@ -1468,6 +1489,7 @@ def main():
             private_max_pairs=args.private_max_pairs,
             spatial_window_size=args.spatial_window_size,
             spatial_window_stride=args.spatial_window_stride,
+            spatial_blur_by_timestep=args.spatial_blur_by_timestep,
         ),
         axis_name="batch",
     )
