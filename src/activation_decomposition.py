@@ -30,6 +30,7 @@ def collect_activations(activations: Any) -> jax.Array:
 def compute_common_private(activations: Any) -> tuple[jax.Array, jax.Array, jax.Array]:
     """Compute differentiable common activation and private residuals."""
     activations = collect_activations(activations)
+    activations = _normalize_channels(activations)
     common = jnp.mean(activations, axis=0)
     common_anchor = jax.lax.stop_gradient(common)
     private = activations - common_anchor[None, ...]
@@ -174,7 +175,6 @@ def compute_aux_losses(
         raise ValueError(f"Expected spatial target with rank 3, got shape {spatial_target.shape}")
 
     common, common_anchor, private = compute_common_private(activations)
-    common_loss = jnp.mean(jnp.square(activations - common_anchor[None, ...]))
 
     spatial_loss, spatial_metrics = local_window_gram_loss(
         common,
@@ -201,7 +201,6 @@ def compute_aux_losses(
     return {
         "common_activation": common,
         "private_activations": private,
-        "loss_common": common_loss,
         "loss_spatial": spatial_loss,
         "loss_private": private_loss,
         "spatial_metrics": spatial_metrics,

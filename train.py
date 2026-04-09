@@ -506,7 +506,6 @@ def ema_update(ema_params, new_params, decay):
 def _zero_aux_metrics(dtype):
     zero = jnp.array(0.0, dtype=dtype)
     return {
-        "loss_common": zero,
         "loss_spatial": zero,
         "loss_private": zero,
         "spatial_metrics": {
@@ -519,23 +518,9 @@ def _zero_aux_metrics(dtype):
     }
 
 
-def _resolve_common_loss_weight(
-    lambda_common,
-    disable_common_loss=False,
-    reverse_common_loss=False,
-):
-    """Map ablation flags to the effective common-loss coefficient."""
-    if disable_common_loss:
-        return 0.0
-    if reverse_common_loss:
-        return -float(lambda_common)
-    return float(lambda_common)
-
-
 def train_step(
     state, ema_params, batch, rng, ema_decay,
-    lambda_common=0.0, lambda_spatial=0.0, lambda_private=0.0,
-    disable_common_loss=False, reverse_common_loss=False,
+    lambda_spatial=0.0, lambda_private=0.0,
     private_max_pairs=0,
     spatial_window_size=DEFAULT_SPATIAL_WINDOW_SIZE,
 ):
@@ -548,12 +533,7 @@ def train_step(
     """
     x0, y = batch  # x0: [local_B, N, D], y: [local_B]
     local_batch = x0.shape[0]
-    common_weight = _resolve_common_loss_weight(
-        lambda_common,
-        disable_common_loss=disable_common_loss,
-        reverse_common_loss=reverse_common_loss,
-    )
-    use_aux_losses = any(weight != 0.0 for weight in (common_weight, lambda_spatial, lambda_private))
+    use_aux_losses = any(weight != 0.0 for weight in (lambda_spatial, lambda_private))
 
     rng, tau_rng, noise_rng, drop_rng, private_pair_rng = jax.random.split(rng, 5)
 
@@ -587,12 +567,10 @@ def train_step(
             aux_metrics = _zero_aux_metrics(target.dtype)
 
         l_diff = jnp.mean((pred - target) ** 2)
-        l_common = aux_metrics["loss_common"]
         l_spatial = aux_metrics["loss_spatial"]
         l_private = aux_metrics["loss_private"]
         loss = (
             l_diff
-            + common_weight * l_common
             + lambda_spatial * l_spatial
             + lambda_private * l_private
         )
@@ -602,7 +580,6 @@ def train_step(
             v_abs_mean,
             v_pred_abs_mean,
             l_diff,
-            l_common,
             l_spatial,
             l_private,
             aux_metrics["spatial_metrics"],
@@ -618,7 +595,6 @@ def train_step(
             v_abs,
             v_pred,
             l_diff,
-            l_common,
             l_spatial,
             l_private,
             spatial_metrics,
@@ -632,7 +608,6 @@ def train_step(
     v_abs = jax.lax.pmean(v_abs, axis_name="batch")
     v_pred = jax.lax.pmean(v_pred, axis_name="batch")
     l_diff = jax.lax.pmean(l_diff, axis_name="batch")
-    l_common = jax.lax.pmean(l_common, axis_name="batch")
     l_spatial = jax.lax.pmean(l_spatial, axis_name="batch")
     l_private = jax.lax.pmean(l_private, axis_name="batch")
     spatial_metrics = jax.lax.pmean(spatial_metrics, axis_name="batch")
@@ -650,7 +625,6 @@ def train_step(
     metrics = {
         "train/loss": loss,
         "train/l_diff": l_diff,
-        "train/l_common": l_common,
         "train/l_spatial": l_spatial,
         "train/l_private": l_private,
         "train/common_norm": norm_common,
@@ -669,20 +643,14 @@ def train_step(
 
 def eval_step(
     state, ema_params, batch, rng,
-    lambda_common=0.0, lambda_spatial=0.0, lambda_private=0.0,
-    disable_common_loss=False, reverse_common_loss=False,
+    lambda_spatial=0.0, lambda_private=0.0,
     private_max_pairs=0,
     spatial_window_size=DEFAULT_SPATIAL_WINDOW_SIZE,
 ):
     """Vanilla SiT validation step (mirrors train_step; no grads; no EMA teacher)."""
     x0, y = batch
     local_batch = x0.shape[0]
-    common_weight = _resolve_common_loss_weight(
-        lambda_common,
-        disable_common_loss=disable_common_loss,
-        reverse_common_loss=reverse_common_loss,
-    )
-    use_aux_losses = any(weight != 0.0 for weight in (common_weight, lambda_spatial, lambda_private))
+    use_aux_losses = any(weight != 0.0 for weight in (lambda_spatial, lambda_private))
 
     rng, tau_rng, noise_rng, private_pair_rng = jax.random.split(rng, 4)
 
@@ -714,13 +682,11 @@ def eval_step(
         aux_metrics = _zero_aux_metrics(target.dtype)
 
     l_diff = jnp.mean((pred - target) ** 2)
-    l_common = aux_metrics["loss_common"]
     l_spatial = aux_metrics["loss_spatial"]
     l_private = aux_metrics["loss_private"]
     spatial_metrics = aux_metrics["spatial_metrics"]
     loss = (
         l_diff
-        + common_weight * l_common
         + lambda_spatial * l_spatial
         + lambda_private * l_private
     )
@@ -729,7 +695,6 @@ def eval_step(
 
     loss = jax.lax.pmean(loss, axis_name="batch")
     l_diff = jax.lax.pmean(l_diff, axis_name="batch")
-    l_common = jax.lax.pmean(l_common, axis_name="batch")
     l_spatial = jax.lax.pmean(l_spatial, axis_name="batch")
     l_private = jax.lax.pmean(l_private, axis_name="batch")
     spatial_metrics = jax.lax.pmean(spatial_metrics, axis_name="batch")
@@ -742,7 +707,6 @@ def eval_step(
     metrics = {
         "val/loss": loss,
         "val/l_diff": l_diff,
-        "val/l_common": l_common,
         "val/l_spatial": l_spatial,
         "val/l_private": l_private,
         "val/common_norm": common_norm,
@@ -1235,12 +1199,6 @@ def main():
     )
     parser.add_argument("--grad-clip", type=float, default=1.0,
                         help="Gradient clip max_norm (paper: 1.0)")
-    parser.add_argument("--lambda-common", type=float, default=0.0,
-                        help="Weight for common alignment auxiliary loss.")
-    parser.add_argument("--disable-common-loss", action="store_true",
-                        help="Ablation: disable the common alignment loss term.")
-    parser.add_argument("--reverse-common-loss", action="store_true",
-                        help="Ablation: reverse the common alignment objective to push A_i away from A.")
     parser.add_argument("--lambda-spatial", type=float, default=0.0,
                         help="Weight for sliding-window local Gram spatial loss.")
     parser.add_argument("--lambda-private", type=float, default=0.0,
@@ -1396,8 +1354,6 @@ def main():
         raise ValueError("--block-corr-batches must be > 0")
     if args.vae_decode_batch_size <= 0:
         raise ValueError("--vae-decode-batch-size must be greater than 0")
-    if args.disable_common_loss and args.reverse_common_loss:
-        raise ValueError("--disable-common-loss and --reverse-common-loss are mutually exclusive")
     if args.private_max_pairs < 0:
         raise ValueError("--private-max-pairs must be >= 0")
     if args.spatial_window_size <= 0:
@@ -1437,9 +1393,6 @@ def main():
     )
     log_stage(
         "Activation decomposition: "
-        f"lambda_common={args.lambda_common} "
-        f"disable_common_loss={args.disable_common_loss} "
-        f"reverse_common_loss={args.reverse_common_loss} "
         f"lambda_spatial={args.lambda_spatial} "
         f"lambda_private={args.lambda_private} "
         f"private_max_pairs={args.private_max_pairs} "
@@ -1486,9 +1439,6 @@ def main():
     pmapped_train_step = jax.pmap(
         partial(
             train_step,
-            lambda_common=args.lambda_common,
-            disable_common_loss=args.disable_common_loss,
-            reverse_common_loss=args.reverse_common_loss,
             lambda_spatial=args.lambda_spatial,
             lambda_private=args.lambda_private,
             private_max_pairs=args.private_max_pairs,
@@ -1499,9 +1449,6 @@ def main():
     pmapped_eval_step = jax.pmap(
         partial(
             eval_step,
-            lambda_common=args.lambda_common,
-            disable_common_loss=args.disable_common_loss,
-            reverse_common_loss=args.reverse_common_loss,
             lambda_spatial=args.lambda_spatial,
             lambda_private=args.lambda_private,
             private_max_pairs=args.private_max_pairs,
