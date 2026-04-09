@@ -678,17 +678,15 @@ def train_step(
                 aux_metrics["avg_pairwise_private_cosine"],
             )
 
-        (
-            component_losses,
-            (
-                v_abs,
-                v_pred,
-                spatial_metrics,
-                norm_common,
-                avg_private_norm,
-                avg_pairwise_private_cosine,
-            ),
-        ), component_grads = jax.jacrev(component_loss_fn, has_aux=True)(state.params)
+        component_losses, (
+            v_abs,
+            v_pred,
+            spatial_metrics,
+            norm_common,
+            avg_private_norm,
+            avg_pairwise_private_cosine,
+        ) = component_loss_fn(state.params)
+        component_grads, _ = jax.jacrev(component_loss_fn, has_aux=True)(state.params)
 
         component_losses = jax.lax.pmean(component_losses, axis_name="batch")
         v_abs = jax.lax.pmean(v_abs, axis_name="batch")
