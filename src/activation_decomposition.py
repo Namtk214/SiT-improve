@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import math
-from typing import Any
+from typing import Any, Callable
 
 import jax
 import jax.numpy as jnp
@@ -317,6 +317,7 @@ def compute_aux_losses(
     common_agg: str = "mean",
     common_logit_normal_center_layer: float = 0.0,
     common_logit_normal_sigma: float = 1.0,
+    common_spatial_project_fn: Callable[[jax.Array], jax.Array] | None = None,
 ) -> dict[str, jax.Array]:
     """Compute auxiliary losses and logging metrics for activation decomposition."""
     activations = collect_activations(activations)
@@ -342,9 +343,14 @@ def compute_aux_losses(
         logit_normal_center_layer=common_logit_normal_center_layer,
         logit_normal_sigma=common_logit_normal_sigma,
     )
+    spatial_common = (
+        common_spatial_project_fn(common)
+        if common_spatial_project_fn is not None
+        else common
+    )
 
     spatial_loss, spatial_metrics = local_window_gram_loss(
-        common,
+        spatial_common,
         spatial_target,
         window_size=spatial_window_size,
         stride=spatial_window_stride,

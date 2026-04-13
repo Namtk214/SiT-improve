@@ -229,6 +229,62 @@ class SimpleHead(nn.Module):
         return x
 
 
+class CommonSpatialCNNProjector(nn.Module):
+    """Lightweight CNN projector for A_common before the spatial auxiliary loss."""
+
+    grid_size: int
+    width: int = 256
+    depth: int = 2
+    kernel_size: int = 3
+
+    @nn.compact
+    def __call__(self, x):
+        if self.width <= 0:
+            raise ValueError(f"CommonSpatialCNNProjector width must be > 0, got {self.width}")
+        if self.depth <= 0:
+            raise ValueError(f"CommonSpatialCNNProjector depth must be > 0, got {self.depth}")
+        if self.kernel_size <= 0 or self.kernel_size % 2 == 0:
+            raise ValueError(
+                f"CommonSpatialCNNProjector kernel_size must be a positive odd integer, got {self.kernel_size}"
+            )
+
+        b, num_tokens, channels = x.shape
+        expected_tokens = self.grid_size * self.grid_size
+        if num_tokens != expected_tokens:
+            raise ValueError(
+                f"CommonSpatialCNNProjector expected {expected_tokens} tokens for a "
+                f"{self.grid_size}x{self.grid_size} grid, got {num_tokens}"
+            )
+
+        x = x.reshape(b, self.grid_size, self.grid_size, channels)
+        x = nn.Conv(
+            features=self.width,
+            kernel_size=(1, 1),
+            padding="SAME",
+            name="input_proj",
+        )(x)
+        x = nn.silu(x)
+
+        for block_idx in range(self.depth):
+            residual = x
+            h = nn.Conv(
+                features=self.width,
+                kernel_size=(self.kernel_size, self.kernel_size),
+                padding="SAME",
+                name=f"block_{block_idx}_conv1",
+            )(x)
+            h = nn.silu(h)
+            h = nn.Conv(
+                features=self.width,
+                kernel_size=(self.kernel_size, self.kernel_size),
+                padding="SAME",
+                name=f"block_{block_idx}_conv2",
+            )(h)
+            x = nn.silu(h + residual)
+
+        return x.reshape(b, num_tokens, self.width)
+
+
 class SelfFlowDiT(nn.Module):
     """Base Self-Flow DiT model."""
     input_size: int = 32
@@ -242,6 +298,10 @@ class SelfFlowDiT(nn.Module):
     learn_sigma: bool = False
     compatibility_mode: bool = False
     per_token: bool = False
+    common_spatial_projector: str = "identity"
+    common_spatial_projector_width: int = 256
+    common_spatial_projector_depth: int = 2
+    common_spatial_projector_kernel_size: int = 3
 
     def setup(self):
         self.out_channels_val = self.in_channels * 2 if self.learn_sigma else self.in_channels
@@ -251,6 +311,27 @@ class SelfFlowDiT(nn.Module):
         pos_embed = get_2d_sincos_pos_embed(self.hidden_size, self.grid_size)
         self.pos_embed_val = pos_embed[None, ...] # (1, num_patches, hidden_size)
         self.feature_head = SimpleHead(in_dim=self.hidden_size, out_dim=self.hidden_size)
+        if self.common_spatial_projector not in ("identity", "cnn"):
+            raise ValueError(
+                "common_spatial_projector must be 'identity' or 'cnn', "
+                f"got {self.common_spatial_projector!r}"
+            )
+        if self.common_spatial_projector == "cnn":
+            self.common_spatial_projector_head = CommonSpatialCNNProjector(
+                grid_size=self.grid_size,
+                width=self.common_spatial_projector_width,
+                depth=self.common_spatial_projector_depth,
+                kernel_size=self.common_spatial_projector_kernel_size,
+                name="common_spatial_projector",
+            )
+        else:
+            self.common_spatial_projector_head = None
+
+    def project_common_spatial(self, common_tokens: jax.Array) -> jax.Array:
+        """Optionally project A_common through a locality-preserving CNN head."""
+        if self.common_spatial_projector_head is None:
+            return common_tokens
+        return self.common_spatial_projector_head(common_tokens)
 
     @nn.compact
     def __call__(
@@ -281,6 +362,10 @@ class SelfFlowDiT(nn.Module):
             embed_dim=self.hidden_size
         )(x)
         x = x + self.pos_embed_val
+
+        if self.common_spatial_projector_head is not None and self.is_mutable_collection("params"):
+            # Initialize projector params even though the head is only used by the aux-loss path.
+            _ = self.project_common_spatial(jnp.zeros_like(x))
 
         t_embedder = TimestepEmbedder(hidden_size=self.hidden_size)
         y_embedder = LabelEmbedder(num_classes=self.num_classes, hidden_size=self.hidden_size, dropout_prob=0.0)

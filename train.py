@@ -368,7 +368,14 @@ DIT_VARIANTS = {
 }
 
 
-def build_model_config(model_size):
+def build_model_config(
+    model_size,
+    *,
+    common_spatial_projector="identity",
+    common_spatial_projector_width=256,
+    common_spatial_projector_depth=2,
+    common_spatial_projector_kernel_size=3,
+):
     model_size = model_size.upper()
     if model_size not in DIT_VARIANTS:
         raise ValueError(
@@ -388,6 +395,10 @@ def build_model_config(model_size):
         num_classes=1001,
         learn_sigma=True,
         compatibility_mode=True,
+        common_spatial_projector=common_spatial_projector,
+        common_spatial_projector_width=common_spatial_projector_width,
+        common_spatial_projector_depth=common_spatial_projector_depth,
+        common_spatial_projector_kernel_size=common_spatial_projector_kernel_size,
     )
 
 
@@ -456,6 +467,10 @@ def create_train_state(rng, config, learning_rate, grad_clip=1.0):
         learn_sigma=config["learn_sigma"],
         compatibility_mode=config["compatibility_mode"],
         per_token=False,
+        common_spatial_projector=config["common_spatial_projector"],
+        common_spatial_projector_width=config["common_spatial_projector_width"],
+        common_spatial_projector_depth=config["common_spatial_projector_depth"],
+        common_spatial_projector_kernel_size=config["common_spatial_projector_kernel_size"],
     )
 
     patch_dim = config["in_channels"] * config["patch_size"] ** 2
@@ -594,6 +609,7 @@ def train_step(
     common_agg="mean",
     common_logit_normal_center_layer=0.0,
     common_logit_normal_sigma=1.0,
+    common_spatial_projector="identity",
 ):
     """Vanilla SiT training step (global timestep; velocity prediction).
 
@@ -636,6 +652,14 @@ def train_step(
                 deterministic=False,
                 rngs={"dropout": drop_rng},
             )
+            if lambda_spatial != 0.0 and common_spatial_projector != "identity":
+                common_spatial_project_fn = lambda common_tokens: state.apply_fn(
+                    {"params": params},
+                    common_tokens,
+                    method=SelfFlowDiT.project_common_spatial,
+                )
+            else:
+                common_spatial_project_fn = None
             aux_metrics = compute_aux_losses(
                 activations,
                 spatial_target=x0,
@@ -649,6 +673,7 @@ def train_step(
                 common_agg=common_agg,
                 common_logit_normal_center_layer=common_logit_normal_center_layer,
                 common_logit_normal_sigma=common_logit_normal_sigma,
+                common_spatial_project_fn=common_spatial_project_fn,
             )
             l_diff = jnp.mean((pred - target) ** 2)
             l_spatial = aux_metrics["loss_spatial"]
@@ -772,6 +797,7 @@ def eval_step(
     common_agg="mean",
     common_logit_normal_center_layer=0.0,
     common_logit_normal_sigma=1.0,
+    common_spatial_projector="identity",
 ):
     """Vanilla SiT validation step (mirrors train_step; no grads; no EMA teacher)."""
     x0, y = batch
@@ -808,6 +834,14 @@ def eval_step(
     )
     if use_aux_losses:
         pred, activations = outputs
+        if lambda_spatial != 0.0 and common_spatial_projector != "identity":
+            common_spatial_project_fn = lambda common_tokens: state.apply_fn(
+                {"params": state.params},
+                common_tokens,
+                method=SelfFlowDiT.project_common_spatial,
+            )
+        else:
+            common_spatial_project_fn = None
         aux_metrics = compute_aux_losses(
             activations,
             spatial_target=x0,
@@ -821,6 +855,7 @@ def eval_step(
             common_agg=common_agg,
             common_logit_normal_center_layer=common_logit_normal_center_layer,
             common_logit_normal_sigma=common_logit_normal_sigma,
+            common_spatial_project_fn=common_spatial_project_fn,
         )
     else:
         pred = outputs
@@ -1014,6 +1049,10 @@ def make_sample_latents_fn(config, num_steps=50, cfg_scale=1.0):
         learn_sigma=config["learn_sigma"],
         compatibility_mode=config["compatibility_mode"],
         per_token=False,
+        common_spatial_projector=config["common_spatial_projector"],
+        common_spatial_projector_width=config["common_spatial_projector_width"],
+        common_spatial_projector_depth=config["common_spatial_projector_depth"],
+        common_spatial_projector_kernel_size=config["common_spatial_projector_kernel_size"],
     )
 
     def sample_latents(params, class_labels, rng):
@@ -1113,6 +1152,10 @@ def make_sample_latents_pmap_fn(config, num_steps=50, cfg_scale=1.0):
         learn_sigma=config["learn_sigma"],
         compatibility_mode=config["compatibility_mode"],
         per_token=False,
+        common_spatial_projector=config["common_spatial_projector"],
+        common_spatial_projector_width=config["common_spatial_projector_width"],
+        common_spatial_projector_depth=config["common_spatial_projector_depth"],
+        common_spatial_projector_kernel_size=config["common_spatial_projector_kernel_size"],
     )
 
     patch_size = config["patch_size"]
@@ -1407,6 +1450,34 @@ def main():
             "Only used when --common-agg=logit_normal."
         ),
     )
+    parser.add_argument(
+        "--common-spatial-projector",
+        type=str,
+        default="identity",
+        choices=["identity", "cnn"],
+        help=(
+            "Optional projector applied to A_common before the spatial Gram loss. "
+            "'identity' keeps the current behavior; 'cnn' uses a lightweight locality-preserving CNN head."
+        ),
+    )
+    parser.add_argument(
+        "--common-spatial-projector-width",
+        type=int,
+        default=256,
+        help="Channel width of the CNN projector used before the spatial Gram loss.",
+    )
+    parser.add_argument(
+        "--common-spatial-projector-depth",
+        type=int,
+        default=2,
+        help="Number of residual 3x3 CNN blocks in the A_common spatial projector.",
+    )
+    parser.add_argument(
+        "--common-spatial-projector-kernel-size",
+        type=int,
+        default=3,
+        help="Kernel size of the CNN projector blocks. Must be a positive odd integer.",
+    )
     parser.add_argument("--spatial-window-size", type=int, default=DEFAULT_SPATIAL_WINDOW_SIZE,
                         help="Sliding window size for local Gram spatial loss.")
     parser.add_argument("--spatial-window-stride", type=int, default=DEFAULT_SPATIAL_WINDOW_STRIDE,
@@ -1585,6 +1656,15 @@ def main():
         raise ValueError("--private-warmup-iters must be >= 0")
     if args.common_agg == "logit_normal" and args.common_logit_normal_sigma <= 0:
         raise ValueError("--common-logit-normal-sigma must be > 0 when --common-agg=logit_normal")
+    if args.common_spatial_projector_width <= 0:
+        raise ValueError("--common-spatial-projector-width must be > 0")
+    if args.common_spatial_projector_depth <= 0:
+        raise ValueError("--common-spatial-projector-depth must be > 0")
+    if (
+        args.common_spatial_projector_kernel_size <= 0
+        or args.common_spatial_projector_kernel_size % 2 == 0
+    ):
+        raise ValueError("--common-spatial-projector-kernel-size must be a positive odd integer")
     if args.spatial_window_size <= 0:
         raise ValueError("--spatial-window-size must be > 0")
     if args.spatial_window_stride <= 0:
@@ -1614,7 +1694,13 @@ def main():
     log_stage(f"TPU Cores: {num_devices}. Global Batch: {args.batch_size}, Local Batch: {local_batch_size}")
 
     # ── Model config ─────────────────────────────────────────────────────────
-    config = build_model_config(args.model_size)
+    config = build_model_config(
+        args.model_size,
+        common_spatial_projector=args.common_spatial_projector,
+        common_spatial_projector_width=args.common_spatial_projector_width,
+        common_spatial_projector_depth=args.common_spatial_projector_depth,
+        common_spatial_projector_kernel_size=args.common_spatial_projector_kernel_size,
+    )
     depth = int(config["depth"])
 
     log_stage(
@@ -1639,8 +1725,16 @@ def main():
         f"spatial_blur_max_sigma={args.spatial_blur_max_sigma} "
         f"common_agg={args.common_agg} "
         f"common_logit_normal_center_layer={args.common_logit_normal_center_layer} "
-        f"common_logit_normal_sigma={args.common_logit_normal_sigma}"
+        f"common_logit_normal_sigma={args.common_logit_normal_sigma} "
+        f"common_spatial_projector={args.common_spatial_projector}"
     )
+    if args.common_spatial_projector == "cnn":
+        log_stage(
+            "A_common spatial projector: "
+            f"width={args.common_spatial_projector_width} "
+            f"depth={args.common_spatial_projector_depth} "
+            f"kernel={args.common_spatial_projector_kernel_size}"
+        )
 
     # ── WandB ─────────────────────────────────────────────────────────────────
     if not args.no_wandb:
@@ -1696,6 +1790,7 @@ def main():
             common_agg=args.common_agg,
             common_logit_normal_center_layer=args.common_logit_normal_center_layer,
             common_logit_normal_sigma=args.common_logit_normal_sigma,
+            common_spatial_projector=args.common_spatial_projector,
         ),
         axis_name="batch",
     )
@@ -1716,6 +1811,7 @@ def main():
             common_agg=args.common_agg,
             common_logit_normal_center_layer=args.common_logit_normal_center_layer,
             common_logit_normal_sigma=args.common_logit_normal_sigma,
+            common_spatial_projector=args.common_spatial_projector,
         ),
         axis_name="batch",
     )
