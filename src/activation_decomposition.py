@@ -11,6 +11,8 @@ import jax.numpy as jnp
 DEFAULT_SPATIAL_WINDOW_SIZE = 3
 DEFAULT_SPATIAL_WINDOW_STRIDE = 1
 DEFAULT_MAX_TIMESTEP_BLUR_SIGMA = 3.0
+DEFAULT_TIMESTEP_BLUR_SCHEDULE = "linear"
+DEFAULT_TIMESTEP_BLUR_EXP_RATE = 5.0
 
 
 def _layer_logit_normal_weights(
@@ -123,6 +125,36 @@ def _normalize_channels(x: jax.Array, eps: float = 1e-8) -> jax.Array:
     return x / jnp.maximum(jnp.linalg.norm(x, axis=-1, keepdims=True), eps)
 
 
+def _timestep_dependent_blur_sigmas(
+    timesteps: jax.Array,
+    max_sigma: float = DEFAULT_MAX_TIMESTEP_BLUR_SIGMA,
+    schedule: str = DEFAULT_TIMESTEP_BLUR_SCHEDULE,
+    exp_rate: float = DEFAULT_TIMESTEP_BLUR_EXP_RATE,
+) -> jax.Array:
+    """Map ``tau`` in ``[0, 1]`` to blur sigma with selectable decay curvature."""
+    tau = jnp.clip(timesteps, 0.0, 1.0)
+    if schedule == "linear":
+        blur_scale = 1.0 - tau
+    elif schedule == "exp-concave":
+        if exp_rate <= 0:
+            raise ValueError("Exponential blur rate must be > 0 for exp-concave schedule.")
+        rate = jnp.asarray(exp_rate, dtype=tau.dtype)
+        denom = jnp.maximum(jnp.expm1(rate), jnp.asarray(1e-6, dtype=tau.dtype))
+        blur_scale = 1.0 - (jnp.expm1(rate * tau) / denom)
+    elif schedule == "exp-convex":
+        if exp_rate <= 0:
+            raise ValueError("Exponential blur rate must be > 0 for exp-convex schedule.")
+        rate = jnp.asarray(exp_rate, dtype=tau.dtype)
+        denom = jnp.maximum(jnp.expm1(rate), jnp.asarray(1e-6, dtype=tau.dtype))
+        blur_scale = jnp.expm1(rate * (1.0 - tau)) / denom
+    else:
+        raise ValueError(
+            f"Unknown timestep blur schedule {schedule!r}; "
+            "expected 'linear', 'exp-concave', or 'exp-convex'."
+        )
+    return jnp.asarray(max_sigma, dtype=tau.dtype) * jnp.clip(blur_scale, 0.0, 1.0)
+
+
 def _gaussian_kernel_1d(
     sigmas: jax.Array,
     max_sigma: float = DEFAULT_MAX_TIMESTEP_BLUR_SIGMA,
@@ -232,6 +264,7 @@ def local_window_gram_loss(
     window_size: int = DEFAULT_SPATIAL_WINDOW_SIZE,
     stride: int = DEFAULT_SPATIAL_WINDOW_STRIDE,
     eps: float = 1e-8,
+    sample_mask: jax.Array | None = None,
     target_blur_sigmas: jax.Array | None = None,
     target_blur_max_sigma: float = DEFAULT_MAX_TIMESTEP_BLUR_SIGMA,
 ) -> tuple[jax.Array, dict[str, jax.Array]]:
@@ -256,15 +289,47 @@ def local_window_gram_loss(
     target_grams = window_gram_matrix(target_windows, eps=eps)
 
     window_losses = jnp.mean(jnp.abs(feature_grams - target_grams), axis=(-2, -1))
-    spatial_loss = jnp.mean(window_losses)
-    blur_sigma_mean = (
-        jnp.mean(target_blur_sigmas.astype(feature_tokens.dtype))
-        if target_blur_sigmas is not None
-        else jnp.array(0.0, dtype=feature_tokens.dtype)
-    )
+    example_losses = jnp.mean(window_losses, axis=-1)
+    if sample_mask is not None:
+        if sample_mask.ndim != 1:
+            raise ValueError(f"Expected sample mask with rank 1, got shape {sample_mask.shape}")
+        if sample_mask.shape[0] != feature_tokens.shape[0]:
+            raise ValueError(
+                "Sample mask batch size and feature batch size must match, "
+                f"got {sample_mask.shape[0]} vs {feature_tokens.shape[0]}"
+            )
+        mask = sample_mask.astype(feature_tokens.dtype)
+        active_count = jnp.sum(mask)
+        spatial_loss = jnp.where(
+            active_count > 0,
+            jnp.sum(example_losses * mask) / active_count,
+            jnp.array(0.0, dtype=feature_tokens.dtype),
+        )
+        active_fraction = active_count / jnp.maximum(
+            jnp.asarray(feature_tokens.shape[0], dtype=feature_tokens.dtype),
+            jnp.array(1.0, dtype=feature_tokens.dtype),
+        )
+        blur_sigma_mean = (
+            jnp.where(
+                active_count > 0,
+                jnp.sum(target_blur_sigmas.astype(feature_tokens.dtype) * mask) / active_count,
+                jnp.array(0.0, dtype=feature_tokens.dtype),
+            )
+            if target_blur_sigmas is not None
+            else jnp.array(0.0, dtype=feature_tokens.dtype)
+        )
+    else:
+        spatial_loss = jnp.mean(example_losses)
+        active_fraction = jnp.array(1.0, dtype=feature_tokens.dtype)
+        blur_sigma_mean = (
+            jnp.mean(target_blur_sigmas.astype(feature_tokens.dtype))
+            if target_blur_sigmas is not None
+            else jnp.array(0.0, dtype=feature_tokens.dtype)
+        )
     spatial_metrics = {
         "spatial_num_windows": jnp.asarray(feature_windows.shape[1], dtype=feature_tokens.dtype),
         "spatial_window_area": jnp.asarray(feature_windows.shape[2], dtype=feature_tokens.dtype),
+        "spatial_active_fraction": active_fraction,
         "spatial_blur_sigma_mean": blur_sigma_mean,
     }
     return spatial_loss, spatial_metrics
@@ -362,8 +427,11 @@ def compute_aux_losses(
     compute_common_private_loss: bool = True,
     spatial_window_size: int = DEFAULT_SPATIAL_WINDOW_SIZE,
     spatial_window_stride: int = DEFAULT_SPATIAL_WINDOW_STRIDE,
+    spatial_timestep_range: tuple[float, float] | None = None,
     spatial_blur_by_timestep: bool = False,
     spatial_blur_max_sigma: float = DEFAULT_MAX_TIMESTEP_BLUR_SIGMA,
+    spatial_blur_schedule: str = DEFAULT_TIMESTEP_BLUR_SCHEDULE,
+    spatial_blur_exp_rate: float = DEFAULT_TIMESTEP_BLUR_EXP_RATE,
     common_agg: str = "mean",
     common_logit_normal_center_layer: float = 0.0,
     common_logit_normal_sigma: float = 1.0,
@@ -373,9 +441,12 @@ def compute_aux_losses(
     activations = collect_activations(activations)
     if spatial_target.ndim != 3:
         raise ValueError(f"Expected spatial target with rank 3, got shape {spatial_target.shape}")
-    if spatial_blur_by_timestep:
+    needs_timesteps = spatial_blur_by_timestep or spatial_timestep_range is not None
+    if needs_timesteps:
         if timesteps is None:
-            raise ValueError("Timesteps are required when timestep-dependent spatial blur is enabled.")
+            raise ValueError(
+                "Timesteps are required when timestep-dependent spatial blur or timestep gating is enabled."
+            )
         if timesteps.ndim != 1:
             raise ValueError(f"Expected timesteps with rank 1, got shape {timesteps.shape}")
         if timesteps.shape[0] != spatial_target.shape[0]:
@@ -383,9 +454,22 @@ def compute_aux_losses(
                 "Timesteps batch size and spatial target batch size must match, "
                 f"got {timesteps.shape[0]} vs {spatial_target.shape[0]}"
             )
-        blur_sigmas = spatial_blur_max_sigma * jnp.clip(1.0 - timesteps, 0.0, 1.0)
+    if spatial_blur_by_timestep:
+        blur_sigmas = _timestep_dependent_blur_sigmas(
+            timesteps,
+            max_sigma=spatial_blur_max_sigma,
+            schedule=spatial_blur_schedule,
+            exp_rate=spatial_blur_exp_rate,
+        )
     else:
         blur_sigmas = None
+    if spatial_timestep_range is not None:
+        spatial_tau_min, spatial_tau_max = spatial_timestep_range
+        spatial_tau_min = jnp.asarray(spatial_tau_min, dtype=timesteps.dtype)
+        spatial_tau_max = jnp.asarray(spatial_tau_max, dtype=timesteps.dtype)
+        spatial_sample_mask = jnp.logical_and(timesteps >= spatial_tau_min, timesteps <= spatial_tau_max)
+    else:
+        spatial_sample_mask = None
 
     common, common_anchor, private = compute_common_private(
         activations,
@@ -404,6 +488,7 @@ def compute_aux_losses(
         spatial_target,
         window_size=spatial_window_size,
         stride=spatial_window_stride,
+        sample_mask=spatial_sample_mask,
         target_blur_sigmas=blur_sigmas,
         target_blur_max_sigma=spatial_blur_max_sigma,
     )

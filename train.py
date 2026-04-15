@@ -429,6 +429,8 @@ from src.activation_decomposition import (
     DEFAULT_MAX_TIMESTEP_BLUR_SIGMA,
     DEFAULT_SPATIAL_WINDOW_SIZE,
     DEFAULT_SPATIAL_WINDOW_STRIDE,
+    DEFAULT_TIMESTEP_BLUR_EXP_RATE,
+    DEFAULT_TIMESTEP_BLUR_SCHEDULE,
 )
 from src.sampling import denoise_loop
 from src.metrics import (
@@ -532,6 +534,7 @@ def _zero_aux_metrics(dtype):
         "spatial_metrics": {
             "spatial_num_windows": zero,
             "spatial_window_area": zero,
+            "spatial_active_fraction": zero,
             "spatial_blur_sigma_mean": zero,
         },
         "norm_common": zero,
@@ -603,8 +606,11 @@ def train_step(
     common_private_max_layers=0,
     spatial_window_size=DEFAULT_SPATIAL_WINDOW_SIZE,
     spatial_window_stride=DEFAULT_SPATIAL_WINDOW_STRIDE,
+    spatial_timestep_range=None,
     spatial_blur_by_timestep=False,
     spatial_blur_max_sigma=DEFAULT_MAX_TIMESTEP_BLUR_SIGMA,
+    spatial_blur_schedule=DEFAULT_TIMESTEP_BLUR_SCHEDULE,
+    spatial_blur_exp_rate=DEFAULT_TIMESTEP_BLUR_EXP_RATE,
     spatial_stop_step=-1,
     spatial_stop_warmup_iters=0,
     private_start_step=0,
@@ -687,8 +693,11 @@ def train_step(
                 compute_common_private_loss=compute_common_private_loss,
                 spatial_window_size=spatial_window_size,
                 spatial_window_stride=spatial_window_stride,
+                spatial_timestep_range=spatial_timestep_range,
                 spatial_blur_by_timestep=spatial_blur_by_timestep,
                 spatial_blur_max_sigma=spatial_blur_max_sigma,
+                spatial_blur_schedule=spatial_blur_schedule,
+                spatial_blur_exp_rate=spatial_blur_exp_rate,
                 common_agg=common_agg,
                 common_logit_normal_center_layer=common_logit_normal_center_layer,
                 common_logit_normal_sigma=common_logit_normal_sigma,
@@ -815,6 +824,7 @@ def train_step(
     }
     metrics["train/spatial_num_windows"] = spatial_metrics["spatial_num_windows"]
     metrics["train/spatial_window_area"] = spatial_metrics["spatial_window_area"]
+    metrics["train/spatial_active_fraction"] = spatial_metrics["spatial_active_fraction"]
     metrics["train/spatial_blur_sigma_mean"] = spatial_metrics["spatial_blur_sigma_mean"]
     return state, ema_params, metrics, rng
 
@@ -826,8 +836,11 @@ def eval_step(
     common_private_max_layers=0,
     spatial_window_size=DEFAULT_SPATIAL_WINDOW_SIZE,
     spatial_window_stride=DEFAULT_SPATIAL_WINDOW_STRIDE,
+    spatial_timestep_range=None,
     spatial_blur_by_timestep=False,
     spatial_blur_max_sigma=DEFAULT_MAX_TIMESTEP_BLUR_SIGMA,
+    spatial_blur_schedule=DEFAULT_TIMESTEP_BLUR_SCHEDULE,
+    spatial_blur_exp_rate=DEFAULT_TIMESTEP_BLUR_EXP_RATE,
     spatial_stop_step=-1,
     spatial_stop_warmup_iters=0,
     private_start_step=0,
@@ -904,8 +917,11 @@ def eval_step(
             compute_common_private_loss=compute_common_private_loss,
             spatial_window_size=spatial_window_size,
             spatial_window_stride=spatial_window_stride,
+            spatial_timestep_range=spatial_timestep_range,
             spatial_blur_by_timestep=spatial_blur_by_timestep,
             spatial_blur_max_sigma=spatial_blur_max_sigma,
+            spatial_blur_schedule=spatial_blur_schedule,
+            spatial_blur_exp_rate=spatial_blur_exp_rate,
             common_agg=common_agg,
             common_logit_normal_center_layer=common_logit_normal_center_layer,
             common_logit_normal_sigma=common_logit_normal_sigma,
@@ -963,6 +979,7 @@ def eval_step(
     }
     metrics["val/spatial_num_windows"] = spatial_metrics["spatial_num_windows"]
     metrics["val/spatial_window_area"] = spatial_metrics["spatial_window_area"]
+    metrics["val/spatial_active_fraction"] = spatial_metrics["spatial_active_fraction"]
     metrics["val/spatial_blur_sigma_mean"] = spatial_metrics["spatial_blur_sigma_mean"]
     return metrics, rng
 
@@ -1557,12 +1574,23 @@ def main():
     parser.add_argument("--spatial-window-stride", type=int, default=DEFAULT_SPATIAL_WINDOW_STRIDE,
                         help="Sliding window stride for local Gram spatial loss.")
     parser.add_argument(
+        "--spatial-timestep-range",
+        type=float,
+        nargs=2,
+        metavar=("MIN_TAU", "MAX_TAU"),
+        default=None,
+        help=(
+            "Only apply spatial Gram loss to samples whose tau is in [MIN_TAU, MAX_TAU]. "
+            "Omit to apply the loss across the full [0, 1] timestep range."
+        ),
+    )
+    parser.add_argument(
         "--spatial-blur-by-timestep",
         action="store_true",
         help=(
             "Blur the spatial Gram target according to timestep. "
-            f"Uses Gaussian sigma that decreases linearly from {DEFAULT_MAX_TIMESTEP_BLUR_SIGMA} "
-            "at tau=0 (most noisy) to 0 at tau=1 (clean)."
+            f"Uses Gaussian sigma that starts at {DEFAULT_MAX_TIMESTEP_BLUR_SIGMA} "
+            "at tau=0 (most noisy) and decays to 0 at tau=1 (clean) using the selected schedule."
         ),
     )
     parser.add_argument(
@@ -1570,6 +1598,27 @@ def main():
         type=float,
         default=DEFAULT_MAX_TIMESTEP_BLUR_SIGMA,
         help="Maximum Gaussian sigma for timestep-dependent spatial blur.",
+    )
+    parser.add_argument(
+        "--spatial-blur-schedule",
+        type=str,
+        default=DEFAULT_TIMESTEP_BLUR_SCHEDULE,
+        choices=["linear", "exp-concave", "exp-convex"],
+        help=(
+            "Decay shape for timestep-dependent spatial blur. "
+            "'linear' matches the old behavior; "
+            "'exp-concave' keeps blur higher longer then drops faster near tau=1; "
+            "'exp-convex' drops blur faster early then flattens near tau=1."
+        ),
+    )
+    parser.add_argument(
+        "--spatial-blur-exp-rate",
+        type=float,
+        default=DEFAULT_TIMESTEP_BLUR_EXP_RATE,
+        help=(
+            "Curvature strength for exponential timestep blur schedules. "
+            "Larger values increase the concavity/convexity. Ignored when --spatial-blur-schedule=linear."
+        ),
     )
     # ── VAE model (must match the variant used in prepare_data_tpu.py) ──────
     parser.add_argument(
@@ -1745,8 +1794,15 @@ def main():
         raise ValueError("--spatial-window-size must be > 0")
     if args.spatial_window_stride <= 0:
         raise ValueError("--spatial-window-stride must be > 0")
+    if args.spatial_timestep_range is not None:
+        spatial_tau_min, spatial_tau_max = args.spatial_timestep_range
+        if spatial_tau_min < 0.0 or spatial_tau_max > 1.0 or spatial_tau_min > spatial_tau_max:
+            raise ValueError("--spatial-timestep-range must satisfy 0 <= MIN_TAU <= MAX_TAU <= 1")
+        args.spatial_timestep_range = (spatial_tau_min, spatial_tau_max)
     if args.spatial_blur_max_sigma < 0:
         raise ValueError("--spatial-blur-max-sigma must be >= 0")
+    if args.spatial_blur_schedule != "linear" and args.spatial_blur_exp_rate <= 0:
+        raise ValueError("--spatial-blur-exp-rate must be > 0 for exponential spatial blur schedules")
 
     # ── Device initialisation ─────────────────────────────────────────────────
     _tpu_init_attempts = 3
@@ -1799,8 +1855,11 @@ def main():
         f"common_private_max_layers={args.common_private_max_layers} "
         f"spatial_window_size={args.spatial_window_size} "
         f"spatial_window_stride={args.spatial_window_stride} "
+        f"spatial_timestep_range={args.spatial_timestep_range} "
         f"spatial_blur_by_timestep={args.spatial_blur_by_timestep} "
         f"spatial_blur_max_sigma={args.spatial_blur_max_sigma} "
+        f"spatial_blur_schedule={args.spatial_blur_schedule} "
+        f"spatial_blur_exp_rate={args.spatial_blur_exp_rate} "
         f"common_agg={args.common_agg} "
         f"common_logit_normal_center_layer={args.common_logit_normal_center_layer} "
         f"common_logit_normal_sigma={args.common_logit_normal_sigma} "
@@ -1865,8 +1924,11 @@ def main():
             common_private_max_layers=args.common_private_max_layers,
             spatial_window_size=args.spatial_window_size,
             spatial_window_stride=args.spatial_window_stride,
+            spatial_timestep_range=args.spatial_timestep_range,
             spatial_blur_by_timestep=args.spatial_blur_by_timestep,
             spatial_blur_max_sigma=args.spatial_blur_max_sigma,
+            spatial_blur_schedule=args.spatial_blur_schedule,
+            spatial_blur_exp_rate=args.spatial_blur_exp_rate,
             common_agg=args.common_agg,
             common_logit_normal_center_layer=args.common_logit_normal_center_layer,
             common_logit_normal_sigma=args.common_logit_normal_sigma,
@@ -1888,8 +1950,11 @@ def main():
             common_private_max_layers=args.common_private_max_layers,
             spatial_window_size=args.spatial_window_size,
             spatial_window_stride=args.spatial_window_stride,
+            spatial_timestep_range=args.spatial_timestep_range,
             spatial_blur_by_timestep=args.spatial_blur_by_timestep,
             spatial_blur_max_sigma=args.spatial_blur_max_sigma,
+            spatial_blur_schedule=args.spatial_blur_schedule,
+            spatial_blur_exp_rate=args.spatial_blur_exp_rate,
             common_agg=args.common_agg,
             common_logit_normal_center_layer=args.common_logit_normal_center_layer,
             common_logit_normal_sigma=args.common_logit_normal_sigma,
