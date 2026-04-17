@@ -168,6 +168,8 @@ The common activation used by the spatial branch is the mean over the sampled wi
   \in
   \mathbb{R}^{B\times N_{\mathrm{tok}}\times D}.
 \]
+This same tensor also serves as the shared reference for the private-loss residuals defined later.
+The per-layer residuals $\bm{A}^{\mathrm{priv}}_\ell$ inside the consecutive window remain a useful decomposition view, but the actual diversity loss is applied to a separate randomly sampled layer set described in Section 8.
 
 \subsection*{6. Spatial projector and coarse target}
 \subsubsection*{6.1 Common-to-latent projector}
@@ -409,26 +411,50 @@ and the corresponding Gram tensors have shape
 So the loss averages an $\ell_1$ mismatch over batch items, over $196$ window locations, and over all $9\times 9$ pairs of token positions within each window.
 
 \subsection*{8. Cosine-squared diversity loss on private residuals}
-For each sampled layer $\ell\in\mathcal{W}$, the private activation is globally average-pooled over tokens:
+The diversity loss no longer uses only the consecutive window $\mathcal{W}$. Instead, after building
 \[
-  \bm{q}_\ell[b,:]
+  \bm{A}^{\mathrm{com}}_{\mathrm{mean}},
+\]
+the implementation samples a second set of distinct layer indices
+\[
+  \mathcal{R}\subseteq\{1,\dots,L\},
+  \qquad
+  |\mathcal{R}|=m,
+\]
+uniformly without replacement. These sampled layers need not be consecutive.
+
+For each sampled layer $r\in\mathcal{R}$, the code first applies the same token-wise LayerNorm:
+\[
+  \tilde{\bm{A}}_r \in \mathbb{R}^{B\times N_{\mathrm{tok}}\times D},
+\]
+and then defines the private residual by subtracting the shared common tensor:
+\[
+  \bm{R}^{\mathrm{priv}}_r
+  =
+  \tilde{\bm{A}}_r - \bm{A}^{\mathrm{com}}_{\mathrm{mean}}.
+\]
+Thus the private branch is encouraged to capture what remains in each randomly chosen layer after removing the shared common pattern distilled from the consecutive window.
+
+For each sampled layer $r\in\mathcal{R}$, the private residual is globally average-pooled over tokens:
+\[
+  \bm{q}_r[b,:]
   =
   \frac{1}{N_{\mathrm{tok}}}
   \sum_{n=1}^{N_{\mathrm{tok}}}
-  \bm{A}^{\mathrm{priv}}_\ell[b,n,:]
+  \bm{R}^{\mathrm{priv}}_r[b,n,:]
   \in \mathbb{R}^{D}.
 \]
 It is then $\ell_2$-normalized:
 \[
-  \hat{\bm{q}}_\ell[b,:]
+  \hat{\bm{q}}_r[b,:]
   =
-  \frac{\bm{q}_\ell[b,:]}{\|\bm{q}_\ell[b,:]\|_2 + \varepsilon}.
+  \frac{\bm{q}_r[b,:]}{\|\bm{q}_r[b,:]\|_2 + \varepsilon}.
 \]
-For all distinct layer pairs $(\ell_i,\ell_j)$ inside the sampled window, define
+For all distinct layer pairs $(r_i,r_j)$ inside the random subset, define
 \[
   c_{ij}(b)
   =
-  \hat{\bm{q}}_{\ell_i}[b,:]^\top \hat{\bm{q}}_{\ell_j}[b,:].
+  \hat{\bm{q}}_{r_i}[b,:]^\top \hat{\bm{q}}_{r_j}[b,:].
 \]
 The diversity loss is the batch-and-pair average of squared cosine similarities:
 \[
@@ -436,12 +462,12 @@ The diversity loss is the batch-and-pair average of squared cosine similarities:
   =
   \frac{1}{B |\mathcal{P}|}
   \sum_{b=1}^{B}
-  \sum_{(\ell_i,\ell_j)\in\mathcal{P}}
+  \sum_{(r_i,r_j)\in\mathcal{P}}
   c_{ij}(b)^2,
 \]
 where
 \[
-  \mathcal{P} = \{(\ell_i,\ell_j): \ell_i < \ell_j,\ \ell_i,\ell_j \in \mathcal{W}\}.
+  \mathcal{P} = \{(r_i,r_j): r_i < r_j,\ r_i,r_j \in \mathcal{R}\}.
 \]
 Thus the optimum encourages private summaries from different layers to be orthogonal after global average pooling.
 
@@ -509,9 +535,9 @@ where
   \item Run the DiT on $(\bm{x}_\tau,\bm{\tau},\bm{y})$ to get $\hat{\bm{v}}_\theta$ and block activations $\{\bm{A}_\ell\}_{\ell=1}^{L}$.
   \item Uniformly sample a consecutive block window of size $m$.
   \item Apply token-wise LayerNorm, average the window activations, detach, and compute the rank-$k$ shared subspace via truncated SVD.
-  \item Project each normalized activation onto the shared subspace to obtain $\bm{A}^{\mathrm{com}}_\ell$, and subtract to obtain $\bm{A}^{\mathrm{priv}}_\ell$.
-  \item Average the common activations over the window, apply the timestep-conditioned projector $\Pi_{\mathrm{sp}}$ to obtain $\bm{Z}\in\mathbb{R}^{B\times 16\times 16\times D}$, patchify and embed the coarse timestep-interpolated target into the same space, and compute the local Gram loss there.
-  \item Global-average-pool each private layer over tokens and compute the cosine-squared diversity loss over all distinct layer pairs.
+  \item Project each normalized activation inside the consecutive window onto the shared subspace to obtain $\bm{A}^{\mathrm{com}}_\ell$, then average them to form $\bm{A}^{\mathrm{com}}_{\mathrm{mean}}$.
+  \item Apply the timestep-conditioned projector $\Pi_{\mathrm{sp}}$ to the averaged common activation $\bm{A}^{\mathrm{com}}_{\mathrm{mean}}$ to obtain $\bm{Z}\in\mathbb{R}^{B\times 16\times 16\times D}$, patchify and embed the coarse timestep-interpolated target into the same space, and compute the local Gram loss there.
+  \item Independently sample $m$ random layers from the full depth, apply token-wise LayerNorm, subtract $\bm{A}^{\mathrm{com}}_{\mathrm{mean}}$ to obtain private residuals, then global-average-pool them and compute the cosine-squared diversity loss over all distinct layer pairs.
   \item Form
   \[
     \mathcal{L}

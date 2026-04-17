@@ -64,6 +64,28 @@ def sample_activation_window(
     return window, start
 
 
+def sample_activation_subset(
+    activations: jax.Array,
+    *,
+    rng: jax.Array | None,
+    sample_size: int,
+) -> tuple[jax.Array, jax.Array]:
+    """Sample ``k`` distinct layers from ``[L, B, N, D]`` activations."""
+    total_layers = activations.shape[0]
+    if total_layers <= 0:
+        raise ValueError("Expected at least one activation layer.")
+
+    selected_size = min(max(int(sample_size), 1), total_layers)
+    if selected_size < total_layers:
+        if rng is None:
+            raise ValueError("An RNG key is required when sampling random layers.")
+        layer_indices = jnp.sort(jax.random.permutation(rng, total_layers)[:selected_size])
+    else:
+        layer_indices = jnp.arange(total_layers, dtype=jnp.int32)
+    subset = jnp.take(activations, layer_indices, axis=0)
+    return subset, layer_indices
+
+
 def extract_sliding_windows(
     grid: jax.Array,
     window_size: int,
@@ -361,9 +383,14 @@ def compute_aux_losses(
             f"got {spatial_target.shape[0]} vs {timesteps.shape[0]}"
         )
 
+    common_window_rng = layer_window_rng
+    private_subset_rng = layer_window_rng
+    if layer_window_rng is not None and compute_diversity_loss:
+        common_window_rng, private_subset_rng = jax.random.split(layer_window_rng)
+
     windowed_activations, window_start = sample_activation_window(
         activations,
-        rng=layer_window_rng,
+        rng=common_window_rng,
         window_size=layer_window_size,
     )
     normalized_window = token_layer_norm(windowed_activations)
@@ -374,7 +401,6 @@ def compute_aux_losses(
     )
 
     common = project_onto_basis(normalized_window, basis)
-    private = normalized_window - common
     common_mean = jnp.mean(common, axis=0)
 
     zero = jnp.array(0.0, dtype=normalized_window.dtype)
@@ -419,17 +445,27 @@ def compute_aux_losses(
         }
 
     if compute_diversity_loss:
-        private_loss, avg_pairwise_cosine, avg_private_norm = gap_pairwise_cosine_squared(private)
+        sampled_private_layers, _ = sample_activation_subset(
+            activations,
+            rng=private_subset_rng,
+            sample_size=layer_window_size,
+        )
+        normalized_private_layers = token_layer_norm(sampled_private_layers)
+        private_residual = normalized_private_layers - common_mean[None, ...]
+        private_loss, avg_pairwise_cosine, avg_private_norm = gap_pairwise_cosine_squared(
+            private_residual
+        )
     else:
         private_loss = zero
         avg_pairwise_cosine = zero
         avg_private_norm = zero
+        private_residual = normalized_window - common
 
     common_norm = jnp.mean(jnp.linalg.norm(common_mean.reshape(common_mean.shape[0], -1), axis=-1))
 
     return {
         "common_activation": common_mean,
-        "private_activations": private,
+        "private_activations": private_residual,
         "loss_spatial": spatial_loss,
         "loss_private": private_loss,
         "spatial_metrics": spatial_metrics,
