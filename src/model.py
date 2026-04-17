@@ -357,9 +357,15 @@ class SelfFlowDiT(nn.Module):
             use_scale=False,
             name="common_spatial_projector_norm",
         )
-        self.common_spatial_projector_modulation = nn.Dense(
-            2 * self.hidden_size,
-            name="common_spatial_projector_modulation",
+        self.common_spatial_projector_shift = nn.Dense(
+            self.hidden_size,
+            kernel_init=nn.initializers.zeros_init(),
+            bias_init=nn.initializers.zeros_init(),
+            name="common_spatial_projector_shift",
+        )
+        self.common_spatial_projector_scale = nn.Dense(
+            self.hidden_size,
+            name="common_spatial_projector_scale",
         )
 
     def project_common_spatial(self, common_tokens: jax.Array, timesteps: jax.Array) -> jax.Array:
@@ -370,11 +376,9 @@ class SelfFlowDiT(nn.Module):
 
         timesteps = 1.0 - timesteps
         timestep_features = self.t_embedder(timesteps)
-        shift, scale = jnp.split(
-            self.common_spatial_projector_modulation(nn.swish(timestep_features)),
-            2,
-            axis=-1,
-        )
+        timestep_features = nn.swish(timestep_features)
+        shift = self.common_spatial_projector_shift(timestep_features)
+        scale = self.common_spatial_projector_scale(timestep_features)
         return modulate(
             self.common_spatial_projector_norm(common_tokens),
             shift,

@@ -232,11 +232,12 @@ def window_gram_upper_triangle(
             f"Expected window tokens with rank 4, got shape {window_tokens.shape}"
         )
     window_area = window_tokens.shape[2]
+    feature_dim = window_tokens.shape[3]
     upper_i, upper_j = jnp.triu_indices(window_area)
     gram_entries = jnp.sum(
         window_tokens[..., upper_i, :] * window_tokens[..., upper_j, :],
         axis=-1,
-    )
+    ) / jnp.asarray(feature_dim, dtype=window_tokens.dtype)
     pair_weights = jnp.where(upper_i == upper_j, 1.0, 2.0).astype(window_tokens.dtype)
     return gram_entries, pair_weights
 

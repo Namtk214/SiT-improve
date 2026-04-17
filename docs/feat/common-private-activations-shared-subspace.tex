@@ -187,7 +187,7 @@ back to patchified latent tokens using
 where:
 \begin{itemize}
   \item $\Pi_{\mathrm{base}}$ is controlled by \texttt{common\_spatial\_projector}; it is either identity or a small CNN applied on the $16\times 16$ token grid, followed by a linear map back to the DiT hidden size $D$,
-  \item $\Pi_{\tau}$ is a timestep-conditioned affine modulation applied after token-wise normalization. In the implementation it reuses the same timestep embedder as the DiT backbone, with the same internal time convention as the main forward pass, so the projection explicitly depends on which flow timestep $\tau$ the current example belongs to.
+  \item $\Pi_{\tau}$ is a timestep-conditioned affine modulation applied after token-wise normalization. In the implementation it reuses the same timestep embedder as the DiT backbone, with the same internal time convention as the main forward pass, so the projection explicitly depends on which flow timestep $\tau$ the current example belongs to. The additive shift vector $\bm{h}_b$ is zero-initialized, whereas the multiplicative scale vector is learned with the default Dense initialization.
 \end{itemize}
 Before this projection, the common tensor still lives in DiT hidden-feature space. Since there are $256=16^2$ tokens, one may equivalently view it as
 \[
@@ -338,13 +338,13 @@ For each batch item $b$, window location $w$, and position indices $u,v\in\{1,\d
 \[
   G^{\mathrm{feat}}_{b,w,u,v}
   =
-  \sum_{c=1}^{D}
+  \frac{1}{D}\sum_{c=1}^{D}
   Z_{b,w,u,c}\, Z_{b,w,v,c},
 \]
 \[
   G^{\mathrm{tgt}}_{b,w,u,v}
   =
-  \sum_{c=1}^{D}
+  \frac{1}{D}\sum_{c=1}^{D}
   \widetilde{X}^{\mathrm{tgt}}_{b,w,u,c}\, \widetilde{X}^{\mathrm{tgt}}_{b,w,v,c},
 \]
 where the target branch is detached.
@@ -356,11 +356,11 @@ Equivalently, for fixed $(b,w)$, the code treats the window as a matrix
 \]
 and then computes
 \[
-  \bm{G}^{\mathrm{feat}}_{b,w} = \bm{Z}_{b,w}\bm{Z}_{b,w}^{\top},
+  \bm{G}^{\mathrm{feat}}_{b,w} = \frac{1}{D}\bm{Z}_{b,w}\bm{Z}_{b,w}^{\top},
   \qquad
   \bm{G}^{\mathrm{tgt}}_{b,w}
   =
-  \widetilde{\bm{X}}^{\mathrm{tgt}}_{b,w}
+  \frac{1}{D}\widetilde{\bm{X}}^{\mathrm{tgt}}_{b,w}
   \left(\widetilde{\bm{X}}^{\mathrm{tgt}}_{b,w}\right)^{\top}.
 \]
 Therefore
