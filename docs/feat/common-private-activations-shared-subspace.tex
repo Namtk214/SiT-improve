@@ -281,6 +281,7 @@ is the latent patch dimension. Finally, the same patch-embedding layer and posit
   \cong
   \mathbb{R}^{B\times 16\times 16\times D}.
 \]
+Before entering the Gram loss, this target token tensor is also passed through the same token-wise LayerNorm operator described earlier, but without any timestep-conditioned modulation.
 Consequently, both the feature branch and the target branch live in the same token-grid feature space:
 \[
   \bm{Z},\ \widetilde{\bm{X}}_{\mathrm{tgt}}
