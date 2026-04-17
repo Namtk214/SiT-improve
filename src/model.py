@@ -387,7 +387,7 @@ class SelfFlowDiT(nn.Module):
 
     def project_spatial_target(self, target_tokens: jax.Array) -> jax.Array:
         """Embed patchified latent targets into the same token-space dimension as A_common."""
-        return self.patch_embed(target_tokens) + self.pos_embed_val
+        return self.patch_embed(target_tokens)
 
     @nn.compact
     def __call__(
