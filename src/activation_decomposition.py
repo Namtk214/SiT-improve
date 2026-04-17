@@ -214,6 +214,16 @@ def build_coarse_spatial_target(
     return (1.0 - tau) * low_grid + tau * clean_grid
 
 
+def l2_normalize_tokens(window_tokens: jax.Array, eps: float = 1e-6) -> jax.Array:
+    """L2-normalize each token vector along the feature dimension."""
+    if window_tokens.ndim != 4:
+        raise ValueError(
+            f"Expected window tokens with rank 4, got shape {window_tokens.shape}"
+        )
+    norms = jnp.linalg.norm(window_tokens, axis=-1, keepdims=True)
+    return window_tokens / jnp.maximum(norms, eps)
+
+
 def window_gram_upper_triangle(
     window_tokens: jax.Array,
 ) -> tuple[jax.Array, jax.Array]:
@@ -263,8 +273,10 @@ def local_window_gram_loss(
 
     feature_windows = extract_sliding_windows(feature_grid, window_size, stride=stride)
     target_windows = extract_sliding_windows(target_grid, window_size, stride=stride)
+    feature_windows = l2_normalize_tokens(feature_windows)
+    target_windows = l2_normalize_tokens(jax.lax.stop_gradient(target_windows))
     feature_gram_entries, pair_weights = window_gram_upper_triangle(feature_windows)
-    target_gram_entries, _ = window_gram_upper_triangle(jax.lax.stop_gradient(target_windows))
+    target_gram_entries, _ = window_gram_upper_triangle(target_windows)
 
     window_area = feature_windows.shape[2]
     weighted_pair_losses = (
