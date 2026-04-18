@@ -415,6 +415,17 @@ except Exception:
 
 import jax
 import jax.numpy as jnp
+
+# Patch JAX config to silently ignore unknown options (e.g. jax_pmap_shmap_merge
+# used by some optax versions against older JAX builds).
+_jax_orig_update = jax.config.update
+def _jax_patched_update(key, val):
+    try:
+        return _jax_orig_update(key, val)
+    except AttributeError:
+        pass
+jax.config.update = _jax_patched_update
+
 import optax
 import wandb
 from flax.training import train_state, checkpoints
