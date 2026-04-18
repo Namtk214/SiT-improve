@@ -374,6 +374,7 @@ def build_model_config(
     common_spatial_projector_width=256,
     common_spatial_projector_depth=2,
     common_spatial_projector_kernel_size=3,
+    common_spatial_projector_use_t=True,
 ):
     model_size = model_size.upper()
     if model_size not in DIT_VARIANTS:
@@ -398,6 +399,7 @@ def build_model_config(
         common_spatial_projector_width=common_spatial_projector_width,
         common_spatial_projector_depth=common_spatial_projector_depth,
         common_spatial_projector_kernel_size=common_spatial_projector_kernel_size,
+        common_spatial_projector_use_t=common_spatial_projector_use_t,
     )
 
 
@@ -471,6 +473,7 @@ def create_train_state(rng, config, learning_rate, grad_clip=1.0):
         common_spatial_projector_width=config["common_spatial_projector_width"],
         common_spatial_projector_depth=config["common_spatial_projector_depth"],
         common_spatial_projector_kernel_size=config["common_spatial_projector_kernel_size"],
+        common_spatial_projector_use_t=config["common_spatial_projector_use_t"],
     )
 
     patch_dim = config["in_channels"] * config["patch_size"] ** 2
@@ -1089,6 +1092,7 @@ def make_sample_latents_fn(config, num_steps=50, cfg_scale=1.0):
         common_spatial_projector_width=config["common_spatial_projector_width"],
         common_spatial_projector_depth=config["common_spatial_projector_depth"],
         common_spatial_projector_kernel_size=config["common_spatial_projector_kernel_size"],
+        common_spatial_projector_use_t=config["common_spatial_projector_use_t"],
     )
 
     def sample_latents(params, class_labels, rng):
@@ -1192,6 +1196,7 @@ def make_sample_latents_pmap_fn(config, num_steps=50, cfg_scale=1.0):
         common_spatial_projector_width=config["common_spatial_projector_width"],
         common_spatial_projector_depth=config["common_spatial_projector_depth"],
         common_spatial_projector_kernel_size=config["common_spatial_projector_kernel_size"],
+        common_spatial_projector_use_t=config["common_spatial_projector_use_t"],
     )
 
     patch_size = config["patch_size"]
@@ -1496,6 +1501,16 @@ def main():
         default=3,
         help="Kernel size of the CNN projector blocks. Must be a positive odd integer.",
     )
+    parser.add_argument(
+        "--common-spatial-projector-use-t",
+        dest="common_spatial_projector_use_t",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Enable timestep-conditioned shift/scale modulation inside project_common_spatial. "
+            "Use --no-common-spatial-projector-use-t to disable timestep conditioning there."
+        ),
+    )
     parser.add_argument("--spatial-window-size", type=int, default=DEFAULT_SPATIAL_WINDOW_SIZE,
                         help="Sliding window size for local Gram spatial loss.")
     parser.add_argument("--spatial-window-stride", type=int, default=DEFAULT_SPATIAL_WINDOW_STRIDE,
@@ -1701,6 +1716,7 @@ def main():
         common_spatial_projector_width=args.common_spatial_projector_width,
         common_spatial_projector_depth=args.common_spatial_projector_depth,
         common_spatial_projector_kernel_size=args.common_spatial_projector_kernel_size,
+        common_spatial_projector_use_t=args.common_spatial_projector_use_t,
     )
     depth = int(config["depth"])
 
@@ -1723,7 +1739,8 @@ def main():
         f"shared_subspace_rank={args.shared_subspace_rank} "
         f"spatial_window_size={args.spatial_window_size} "
         f"spatial_window_stride={args.spatial_window_stride} "
-        f"common_spatial_projector={args.common_spatial_projector}"
+        f"common_spatial_projector={args.common_spatial_projector} "
+        f"common_spatial_projector_use_t={args.common_spatial_projector_use_t}"
     )
     if args.common_spatial_projector == "cnn":
         log_stage(

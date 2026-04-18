@@ -302,6 +302,7 @@ class SelfFlowDiT(nn.Module):
     common_spatial_projector_width: int = 256
     common_spatial_projector_depth: int = 2
     common_spatial_projector_kernel_size: int = 3
+    common_spatial_projector_use_t: bool = True
 
     def setup(self):
         self.out_channels_val = self.in_channels * 2 if self.learn_sigma else self.in_channels
@@ -369,10 +370,14 @@ class SelfFlowDiT(nn.Module):
         )
 
     def project_common_spatial(self, common_tokens: jax.Array, timesteps: jax.Array) -> jax.Array:
-        """Project A_common into a timestep-conditioned token-space tensor Z."""
+        """Project A_common into token space, optionally modulated by timestep."""
         if self.common_spatial_projector_head is not None:
             common_tokens = self.common_spatial_projector_head(common_tokens)
             common_tokens = self.common_spatial_projector_to_hidden(common_tokens)
+
+        common_tokens = self.common_spatial_projector_norm(common_tokens)
+        if not self.common_spatial_projector_use_t:
+            return common_tokens
 
         timesteps = 1.0 - timesteps
         timestep_features = self.t_embedder(timesteps)
@@ -380,7 +385,7 @@ class SelfFlowDiT(nn.Module):
         shift = self.common_spatial_projector_shift(timestep_features)
         scale = self.common_spatial_projector_scale(timestep_features)
         return modulate(
-            self.common_spatial_projector_norm(common_tokens),
+            common_tokens,
             shift,
             scale,
         )
