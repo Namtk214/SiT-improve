@@ -679,23 +679,60 @@ def train_step(
                     target_tokens,
                     method=SelfFlowDiT.project_spatial_target,
                 )
+
+                def compute_aux_with_spatial(_):
+                    return compute_aux_losses(
+                        activations,
+                        spatial_target=x0,
+                        timesteps=tau,
+                        layer_window_rng=layer_window_rng,
+                        layer_window_size=layer_window_size,
+                        shared_subspace_rank=shared_subspace_rank,
+                        compute_spatial_loss=True,
+                        compute_diversity_loss=lambda_private != 0.0,
+                        spatial_window_size=spatial_window_size,
+                        spatial_window_stride=spatial_window_stride,
+                        common_spatial_project_fn=common_spatial_project_fn,
+                        spatial_target_project_fn=spatial_target_project_fn,
+                    )
+
+                def compute_aux_without_spatial(_):
+                    return compute_aux_losses(
+                        activations,
+                        spatial_target=x0,
+                        timesteps=tau,
+                        layer_window_rng=layer_window_rng,
+                        layer_window_size=layer_window_size,
+                        shared_subspace_rank=shared_subspace_rank,
+                        compute_spatial_loss=False,
+                        compute_diversity_loss=lambda_private != 0.0,
+                        spatial_window_size=spatial_window_size,
+                        spatial_window_stride=spatial_window_stride,
+                        common_spatial_project_fn=None,
+                        spatial_target_project_fn=None,
+                    )
+
+                aux_metrics = jax.lax.cond(
+                    effective_lambda_spatial > 0.0,
+                    compute_aux_with_spatial,
+                    compute_aux_without_spatial,
+                    operand=effective_lambda_spatial,
+                )
             else:
-                common_spatial_project_fn = None
-                spatial_target_project_fn = None
-            aux_metrics = compute_aux_losses(
-                activations,
-                spatial_target=x0,
-                timesteps=tau,
-                layer_window_rng=layer_window_rng,
-                layer_window_size=layer_window_size,
-                shared_subspace_rank=shared_subspace_rank,
-                compute_spatial_loss=lambda_spatial != 0.0,
-                compute_diversity_loss=lambda_private != 0.0,
-                spatial_window_size=spatial_window_size,
-                spatial_window_stride=spatial_window_stride,
-                common_spatial_project_fn=common_spatial_project_fn,
-                spatial_target_project_fn=spatial_target_project_fn,
-            )
+                aux_metrics = compute_aux_losses(
+                    activations,
+                    spatial_target=x0,
+                    timesteps=tau,
+                    layer_window_rng=layer_window_rng,
+                    layer_window_size=layer_window_size,
+                    shared_subspace_rank=shared_subspace_rank,
+                    compute_spatial_loss=False,
+                    compute_diversity_loss=lambda_private != 0.0,
+                    spatial_window_size=spatial_window_size,
+                    spatial_window_stride=spatial_window_stride,
+                    common_spatial_project_fn=None,
+                    spatial_target_project_fn=None,
+                )
             l_diff = jnp.mean((pred - target) ** 2)
             l_spatial = aux_metrics["loss_spatial"]
             l_private = aux_metrics["loss_private"]
@@ -885,23 +922,60 @@ def eval_step(
                 target_tokens,
                 method=SelfFlowDiT.project_spatial_target,
             )
+
+            def compute_aux_with_spatial(_):
+                return compute_aux_losses(
+                    activations,
+                    spatial_target=x0,
+                    timesteps=tau,
+                    layer_window_rng=layer_window_rng,
+                    layer_window_size=layer_window_size,
+                    shared_subspace_rank=shared_subspace_rank,
+                    compute_spatial_loss=True,
+                    compute_diversity_loss=lambda_private != 0.0,
+                    spatial_window_size=spatial_window_size,
+                    spatial_window_stride=spatial_window_stride,
+                    common_spatial_project_fn=common_spatial_project_fn,
+                    spatial_target_project_fn=spatial_target_project_fn,
+                )
+
+            def compute_aux_without_spatial(_):
+                return compute_aux_losses(
+                    activations,
+                    spatial_target=x0,
+                    timesteps=tau,
+                    layer_window_rng=layer_window_rng,
+                    layer_window_size=layer_window_size,
+                    shared_subspace_rank=shared_subspace_rank,
+                    compute_spatial_loss=False,
+                    compute_diversity_loss=lambda_private != 0.0,
+                    spatial_window_size=spatial_window_size,
+                    spatial_window_stride=spatial_window_stride,
+                    common_spatial_project_fn=None,
+                    spatial_target_project_fn=None,
+                )
+
+            aux_metrics = jax.lax.cond(
+                effective_lambda_spatial > 0.0,
+                compute_aux_with_spatial,
+                compute_aux_without_spatial,
+                operand=effective_lambda_spatial,
+            )
         else:
-            common_spatial_project_fn = None
-            spatial_target_project_fn = None
-        aux_metrics = compute_aux_losses(
-            activations,
-            spatial_target=x0,
-            timesteps=tau,
-            layer_window_rng=layer_window_rng,
-            layer_window_size=layer_window_size,
-            shared_subspace_rank=shared_subspace_rank,
-            compute_spatial_loss=lambda_spatial != 0.0,
-            compute_diversity_loss=lambda_private != 0.0,
-            spatial_window_size=spatial_window_size,
-            spatial_window_stride=spatial_window_stride,
-            common_spatial_project_fn=common_spatial_project_fn,
-            spatial_target_project_fn=spatial_target_project_fn,
-        )
+            aux_metrics = compute_aux_losses(
+                activations,
+                spatial_target=x0,
+                timesteps=tau,
+                layer_window_rng=layer_window_rng,
+                layer_window_size=layer_window_size,
+                shared_subspace_rank=shared_subspace_rank,
+                compute_spatial_loss=False,
+                compute_diversity_loss=lambda_private != 0.0,
+                spatial_window_size=spatial_window_size,
+                spatial_window_stride=spatial_window_stride,
+                common_spatial_project_fn=None,
+                spatial_target_project_fn=None,
+            )
     else:
         pred = outputs
         aux_metrics = _zero_aux_metrics(target.dtype)
