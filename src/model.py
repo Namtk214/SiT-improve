@@ -375,7 +375,6 @@ class SelfFlowDiT(nn.Module):
             common_tokens = self.common_spatial_projector_head(common_tokens)
             common_tokens = self.common_spatial_projector_to_hidden(common_tokens)
 
-        common_tokens = self.common_spatial_projector_norm(common_tokens)
         if not self.common_spatial_projector_use_t:
             return common_tokens
 

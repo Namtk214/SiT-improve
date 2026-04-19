@@ -10,6 +10,23 @@ import jax.image
 import jax.numpy as jnp
 
 DEFAULT_SPATIAL_WINDOW_SIZE = 3
+DEFAULT_SPATIAL_NORM_GAMMA = 0.7
+
+
+def spatial_token_norm(x: jax.Array, gamma: float = DEFAULT_SPATIAL_NORM_GAMMA, eps: float = 1e-6) -> jax.Array:
+    """I-REPA-style spatial normalization: normalize across token/spatial dimension T.
+
+    Args:
+        x: ``[B, T, D]`` token tensor.
+        gamma: scaling factor for the mean subtraction (I-REPA default 0.7).
+        eps: numerical stability epsilon.
+
+    Returns:
+        Normalized tensor of the same shape as ``x``.
+    """
+    mean = jnp.mean(x, axis=1, keepdims=True)   # [B, 1, D]
+    std = jnp.std(x, axis=1, keepdims=True)      # [B, 1, D]
+    return (x - gamma * mean) / (std + eps)
 DEFAULT_SPATIAL_WINDOW_STRIDE = 1
 DEFAULT_ACTIVATION_WINDOW_SIZE = 4
 DEFAULT_SHARED_SUBSPACE_RANK = 6
@@ -411,6 +428,7 @@ def compute_aux_losses(
             raise ValueError("A target projector is required when compute_spatial_loss=True.")
 
         projected_common = common_spatial_project_fn(common_mean, timesteps)
+        projected_common = spatial_token_norm(projected_common)
         feature_grid = tokens_to_grid(projected_common).astype(jnp.float32)
         target_grid = build_coarse_spatial_target(
             spatial_target,
@@ -424,7 +442,7 @@ def compute_aux_losses(
             patch_size=patch_size,
         )
         target_features = spatial_target_project_fn(target_tokens)
-        target_features = token_layer_norm(target_features)
+        target_features = spatial_token_norm(target_features)
         target_feature_grid = tokens_to_grid(target_features).astype(jnp.float32)
         spatial_loss, spatial_metrics = local_window_gram_loss(
             feature_grid,
